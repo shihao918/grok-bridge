@@ -260,13 +260,14 @@ def flush_grok_queue() -> int:
 def dispatch(payload: dict) -> dict:
     """Single dispatch point shared by all transports. Policy-aware routing."""
     explicit = payload.get("handler")
+    default_handler = bc.config().get("default_handler", "echo")
     if explicit:
         handler_name = explicit
     elif runtime["exhausted"] and runtime["policy"] == "local" and LOCAL_FALLBACK:
         handler_name = "local"
         log("  dispatch: quota exhausted + policy=local → routing to local model")
     else:
-        handler_name = "echo"
+        handler_name = default_handler
 
     handler = HANDLERS.get(handler_name)
     if handler is None:
@@ -613,8 +614,15 @@ class StandaloneHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/chat":
+            data = CHAT_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
-            self._json(404, {"error": "not found (GET /health | /quota | /ui)"})
+            self._json(404, {"error": "not found (GET /health | /quota | /ui | /chat)"})
 
     def log_message(self, fmt, *args):  # silence stderr
         pass
@@ -635,15 +643,13 @@ if not TRANSPORTS:
 
 
 def main() -> None:
-    log(f"transports: {sorted(TRANSPORTS)} | policy: {runtime['policy']}")
+    log(f"transports: {sorted(TRANSPORTS)} | policy: {runtime['policy']} | default_handler: {bc.config().get('default_handler', 'echo')}")
     if "standalone" in TRANSPORTS:
         threading.Thread(target=standalone_server, daemon=True).start()
     if "grok" in TRANSPORTS:
         grok_loop()
     else:
-        log("[grok] transport disabled by config; standalone-only mode")
-        if LOCAL_FALLBACK:
-            threading.Thread(target=quota_watch_loop, daemon=True).start()
+        log("[grok] transport disabled by config; standalone-only mode (zero Grok API calls)")
         while True:
             time.sleep(3600)
 
