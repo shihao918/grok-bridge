@@ -431,6 +431,45 @@ refreshQuota();setInterval(refreshQuota,60000);
 </script></body></html>"""
 
 
+CHAT_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Bridge Chat</title>
+<style>
+body{font-family:Segoe UI,sans-serif;max-width:760px;margin:0 auto;height:100vh;display:flex;flex-direction:column;background:#111;color:#eee}
+header{padding:12px 16px;background:#1c1c24;display:flex;justify-content:space-between;align-items:center}
+header select{background:#0d0d12;color:#eee;border:1px solid #333;border-radius:6px;padding:6px}
+#chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:80%;padding:10px 14px;border-radius:12px;white-space:pre-wrap;word-break:break-word}
+.user{align-self:flex-end;background:#4f6ef7;color:#fff}
+.bot{align-self:flex-start;background:#1c1c24;border:1px solid #333}
+.meta{font-size:11px;opacity:.6;margin-bottom:4px}
+footer{display:flex;gap:8px;padding:12px 16px;background:#1c1c24}
+input{flex:1;background:#0d0d12;color:#eee;border:1px solid #333;border-radius:8px;padding:12px}
+button{background:#4f6ef7;color:#fff;border:0;border-radius:8px;padding:12px 20px;cursor:pointer}
+</style></head><body>
+<header><b>Bridge Chat（本地运行，不消耗 Grok 配额）</b>
+<select id="engine"><option value="local">本地模型 (Ollama)</option><option value="langgraph">LangGraph 群聊</option><option value="autogen">AutoGen 团队</option><option value="echo">echo</option></select></header>
+<div id="chat"></div>
+<footer><input id="in" placeholder="输入消息，回车发送…" autofocus
+ onkeydown="if(event.key==='Enter')send()"/><button onclick="send()">发送</button></footer>
+<script>
+const chat=document.getElementById('chat');
+function add(role,text,meta){const d=document.createElement('div');d.className='msg '+role;
+d.innerHTML=(meta?'<div class="meta">'+meta+'</div>':'')+text.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d}
+async function send(){const inp=document.getElementById('in');const t=inp.value.trim();if(!t)return;
+inp.value='';add('user',t);
+const e=document.getElementById('engine').value;
+const w=add('bot','…','engine: '+e);
+try{const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handler:e,task:t})});
+const d=await r.json();
+let text='';
+if(d.engine&&d.engine.startsWith('local'))text=d.reply||'(空)';
+else if(d.turns)text=d.turns.map(x=>'['+x.speaker+'] '+x.text).join('\\n\\n');
+else text=d.echo!==undefined?d.echo:JSON.stringify(d,null,2);
+w.innerHTML='<div class="meta">engine: '+(d.engine||e)+'</div>'+text.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+catch(err){w.textContent='错误: '+err}}
+</script></body></html>"""
+
+
 class StandaloneHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
