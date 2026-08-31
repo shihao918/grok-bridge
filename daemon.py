@@ -178,19 +178,25 @@ def handle_echo(task: str) -> dict:
 HANDLERS = {"langgraph": handle_langgraph, "autogen": handle_autogen, "echo": handle_echo}
 
 
-def run_handler_response(rid: str, client: dict) -> dict:
-    try:
-        msg = json.loads(client.get("messageJson", "{}"))
-    except Exception:
-        msg = {"raw": client.get("messageJson", "")}
-    task = msg.get("task", "")
-    handler = HANDLERS.get(msg.get("handler", "echo"), handle_echo)
-    log(f"  request {rid[:8]}: handler={msg.get('handler')} task={task[:60]!r}")
+def dispatch(payload: dict) -> dict:
+    """Single dispatch point shared by all transports (Grok channel + standalone HTTP)."""
+    task = payload.get("task", "")
+    handler = HANDLERS.get(payload.get("handler", "echo"), handle_echo)
+    log(f"  dispatch: handler={payload.get('handler')} task={task[:60]!r}")
     try:
         result = handler(task)
     except Exception as e:
         result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    return {"requestId": rid, "client": {"messageJson": json.dumps({"bridge": LABEL, **result}), "cwdState": LOCAL_ROOT}}
+    return {"bridge": LABEL, **result}
+
+
+def run_handler_response(rid: str, client: dict) -> dict:
+    try:
+        payload = json.loads(client.get("messageJson", "{}"))
+    except Exception:
+        payload = {"raw": client.get("messageJson", "")}
+    res = dispatch(payload)
+    return {"requestId": rid, "client": {"messageJson": json.dumps(res), "cwdState": LOCAL_ROOT}}
 
 
 def process_frame(qr: dict) -> dict:
@@ -206,20 +212,61 @@ def process_frame(qr: dict) -> dict:
         log(f"  request {rid[:8]}: exec frame (standing={ex.get('authorizedByStanding')}, approval={ex.get('authorizedByApproval')})")
         raw = ex.get("serverMessageJson", "")
         try:
-            msg = json.loads(raw) if raw else {}
+            payload = json.loads(raw) if raw else {}
         except Exception:
-            msg = {"task": raw}
-        task = msg.get("task", raw if isinstance(raw, str) else json.dumps(msg))
-        handler = HANDLERS.get(msg.get("handler", "echo"), handle_echo)
-        try:
-            result = handler(task)
-        except Exception as e:
-            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        return {"requestId": rid, "client": {"messageJson": json.dumps({"bridge": LABEL, **result}), "cwdState": LOCAL_ROOT}}
+            payload = {"task": raw}
+        res = dispatch(payload)
+        return {"requestId": rid, "client": {"messageJson": json.dumps(res), "cwdState": LOCAL_ROOT}}
 
     kinds = [k for k in ("upload", "download", "cancel", "retireApproval") if frame.get(k)]
     log(f"  request {rid[:8]}: declining {kinds}")
     return {"requestId": rid, "fileError": {"resultJson": json.dumps({"error": f"bridge handles exec/messagesOp; got {kinds}"})}}
+
+
+# ---------- standalone transport (local HTTP, Grok-independent) ----------
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+STANDALONE_BIND = bc.config().get("standalone_bind", "127.0.0.1")
+STANDALONE_PORT = int(bc.config().get("standalone_port", 18083))
+
+
+class StandaloneHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _json(self, code: int, obj: dict) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):  # noqa: N802
+        if self.path != "/run":
+            self._json(404, {"error": "not found (POST /run)"})
+            return
+        length = int(self.headers.get("content-length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._json(400, {"error": "invalid json"})
+            return
+        self._json(200, dispatch(payload))
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/health":
+            self._json(200, {"ok": True, "label": LABEL, "engines": sorted(HANDLERS)})
+            return
+        self._json(404, {"error": "not found (GET /health)"})
+
+    def log_message(self, fmt, *args):  # silence stderr
+        pass
+
+
+def standalone_server() -> None:
+    srv = ThreadingHTTPServer((STANDALONE_BIND, STANDALONE_PORT), StandaloneHandler)
+    log(f"[standalone] listening on {STANDALONE_BIND}:{STANDALONE_PORT} (POST /run, GET /health)")
+    srv.serve_forever()
 
 
 # ---------- watch (presence) ----------
@@ -266,6 +313,7 @@ def main():
     if not credential_valid():
         refresh_credential()
     log(f"machine_id: {state['machine_id']} (credential exp {state.get('credential_expires_at_ms')})")
+    threading.Thread(target=standalone_server, daemon=True).start()
     threading.Thread(target=watch_loop, args=(state["credential"],), daemon=True).start()
     log("polling...")
     while True:

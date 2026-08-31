@@ -72,6 +72,22 @@ Docs: [protocol notes](docs/protocol.md) · [writing a handler](docs/handlers.md
 
 Adding an engine is one function in `HANDLERS`.
 
+## Standalone mode (Grok-independent)
+
+The daemon exposes a local HTTP entry point with the same handler contract:
+
+```
+GET  http://127.0.0.1:18083/health          → {"ok": true, "engines": [...]}
+POST http://127.0.0.1:18083/run             → {"handler": "...", "task": "..."}
+```
+
+This path never touches Grok — even if your Grok Bot quota is exhausted or the
+account is gone, the multi-agent pipelines keep working. The Grok UserComputer
+channel and the standalone API run in parallel and share the same dispatch layer.
+
+Bind/port are configurable via `state/config.json` (`standalone_bind`,
+`standalone_port`, default `127.0.0.1:18083` — local-only by design).
+
 ## Gateway failover
 
 `local_proxy.py` supports multiple upstreams in `state/config.json`:
