@@ -88,6 +88,21 @@ channel and the standalone API run in parallel and share the same dispatch layer
 Bind/port are configurable via `state/config.json` (`standalone_bind`,
 `standalone_port`, default `127.0.0.1:18083` — local-only by design).
 
+## Transport selection
+
+Choose which transports run via `state/config.json`:
+
+```json
+{"transports": ["grok", "standalone"]}
+```
+
+- `["grok", "standalone"]` — both (default)
+- `["grok"]` — cloud-dispatch only
+- `["standalone"]` — fully Grok-independent (no Grok API calls at all)
+
+`GET /health` reports the active transports. Invalid or empty values are rejected
+at startup.
+
 ## Gateway failover
 
 `local_proxy.py` supports multiple upstreams in `state/config.json`:
