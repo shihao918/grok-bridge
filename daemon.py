@@ -200,6 +200,62 @@ def handle_local(task: str) -> dict:
 
 HANDLERS = {"langgraph": handle_langgraph, "autogen": handle_autogen, "echo": handle_echo, "local": handle_local}
 
+# ---------- quota queue (tasks for Grok agents, auto-released at reset) ----------
+QUEUE_FILE = os.path.join(bc.STATE_DIR, "grok_queue.json")
+GROK_AGENT_ID = _cfg.get("grok_agent_id", "")
+
+
+def load_queue() -> list:
+    if os.path.exists(QUEUE_FILE):
+        return json.load(open(QUEUE_FILE, encoding="utf-8"))
+    return []
+
+
+def save_queue(q: list) -> None:
+    json.dump(q, open(QUEUE_FILE, "w", encoding="utf-8"), indent=2)
+
+
+def send_to_grok_agent(agent_id: str, task: str) -> dict:
+    return call(
+        "SendGrokBotUserMessage",
+        {
+            "agentId": agent_id,
+            "messageId": str(uuid.uuid4()),
+            "text": task,
+            "sentAtMs": int(time.time() * 1000),
+            "isFork": False,
+        },
+    )
+
+
+def handle_grok_agent(task: str) -> dict:
+    """Dispatch a task to a Grok cloud agent. Queues automatically while quota is exhausted."""
+    if not GROK_AGENT_ID:
+        return {"ok": False, "engine": "grok-agent", "error": "set grok_agent_id in state/config.json"}
+    if runtime["exhausted"]:
+        q = load_queue()
+        q.append({"task": task, "queuedAt": time.time()})
+        save_queue(q)
+        return {"ok": True, "engine": "grok-agent", "queued": True, "position": len(q), "note": "will auto-dispatch at quota reset"}
+    r = send_to_grok_agent(GROK_AGENT_ID, task)
+    return {"ok": r.get("dispatched", False), "engine": "grok-agent", "delivery": r.get("delivery")}
+
+
+def flush_grok_queue() -> int:
+    q = load_queue()
+    sent = 0
+    for item in q:
+        try:
+            send_to_grok_agent(GROK_AGENT_ID, item["task"])
+            sent += 1
+        except Exception as e:
+            log(f"[queue] flush error: {e}")
+            break
+    save_queue([])
+    if sent:
+        log(f"[queue] flushed {sent}/{len(q)} queued task(s) to Grok")
+    return sent
+
 
 def dispatch(payload: dict) -> dict:
     """Single dispatch point shared by all transports. Policy-aware routing."""
@@ -271,6 +327,8 @@ def quota_watch_loop() -> None:
                     log(f"[quota] usage={pct}% plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
                 if exhausted:
                     toast_choice()
+                elif runtime["exhausted"] and GROK_AGENT_ID:
+                    flush_grok_queue()  # reset happened → release queued tasks
             runtime["exhausted"] = exhausted
             first = False
         except Exception as e:
@@ -286,36 +344,39 @@ def grok_loop() -> None:
     threading.Thread(target=quota_watch_loop, daemon=True).start()
     threading.Thread(target=watch_loop, args=(state["credential"],), daemon=True).start()
     while True:
-        if not credential_valid():
-            refresh_credential()
-            log("credential refreshed")
-        poll = call(
-            "PollGrokBotUserComputerRequests",
-            {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": [], "limit": 10},
-        )
-        queued = poll.get("requests", [])
-        if queued:
-            log(f"got {len(queued)} request(s)")
-            frames, acks = [], []
-            for qr in queued:
-                try:
-                    resp = process_frame(qr)
-                    if resp:
-                        frames.append(resp)
-                    acks.append(qr["id"])
-                except Exception as e:
-                    log(f"  frame error: {e}")
-                    acks.append(qr["id"])
-            if frames:
-                r = call(
-                    "SubmitGrokBotUserComputerResponses",
-                    {"machineId": state["machine_id"], "credential": state["credential"], "frames": frames},
-                )
-                log(f"  submitted, accepted={r.get('acceptedCount')}")
-            call(
+        try:
+            if not credential_valid():
+                refresh_credential()
+                log("credential refreshed")
+            poll = call(
                 "PollGrokBotUserComputerRequests",
-                {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
+                {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": [], "limit": 10},
             )
+            queued = poll.get("requests", [])
+            if queued:
+                log(f"got {len(queued)} request(s)")
+                frames, acks = [], []
+                for qr in queued:
+                    try:
+                        resp = process_frame(qr)
+                        if resp:
+                            frames.append(resp)
+                        acks.append(qr["id"])
+                    except Exception as e:
+                        log(f"  frame error: {e}")
+                        acks.append(qr["id"])
+                if frames:
+                    r = call(
+                        "SubmitGrokBotUserComputerResponses",
+                        {"machineId": state["machine_id"], "credential": state["credential"], "frames": frames},
+                    )
+                    log(f"  submitted, accepted={r.get('acceptedCount')}")
+                call(
+                    "PollGrokBotUserComputerRequests",
+                    {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
+                )
+        except Exception as e:
+            log(f"[grok] poll cycle error ({type(e).__name__}: {str(e)[:100]}), continuing")
         time.sleep(3)
 
 
@@ -393,6 +454,7 @@ def watch_loop(credential: str) -> None:
 # ---------- standalone transport + web UI ----------
 STANDALONE_BIND = _cfg.get("standalone_bind", "127.0.0.1")
 STANDALONE_PORT = int(_cfg.get("standalone_port", 18083))
+STANDALONE_TOKEN = _cfg.get("standalone_token", "")
 
 UI_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Grok Bridge</title>
 <style>
@@ -482,6 +544,9 @@ class StandaloneHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):  # noqa: N802
+        if STANDALONE_TOKEN and self.headers.get("x-bridge-token") != STANDALONE_TOKEN:
+            self._json(403, {"error": "missing/wrong x-bridge-token"})
+            return
         if self.path == "/run":
             length = int(self.headers.get("content-length") or 0)
             try:
