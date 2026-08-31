@@ -103,6 +103,24 @@ Choose which transports run via `state/config.json`:
 `GET /health` reports the active transports. Invalid or empty values are rejected
 at startup.
 
+## Quota exhaustion → local model fallback
+
+A quota watcher polls `GetSandUsageStatus` (every `quota_check_minutes`, default 10).
+When `usagePercent` hits `quota_threshold` (default 100), a **Windows dialog pops up**:
+
+> "Grok 周配额已用完（100%）。是否切换到本地模型（Ollama）继续工作？" 是/否
+
+- **是** → `policy = local`: tasks without an explicit handler route to the local
+  Ollama model (`ollama_url` + `ollama_model` in config)
+- **否** → `policy = wait`: keep waiting for the weekly reset
+
+The choice is changeable anytime: local console at `http://127.0.0.1:18083/ui`
+(quota card + policy toggle + direct task submission), or
+`POST /policy {"mode": "local" | "auto" | "wait"}`. `GET /quota` returns live usage.
+
+The local-model path uses **your own compute** (Ollama) — Grok quota exhaustion does
+not affect it. The cloud agent's own quota only governs what the *Bot* can do.
+
 ## Gateway failover
 
 `local_proxy.py` supports multiple upstreams in `state/config.json`:

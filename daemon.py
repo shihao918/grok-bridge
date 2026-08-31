@@ -1,35 +1,47 @@
-"""Grok Bot UserComputer bridge daemon (production location).
+"""Grok Bot UserComputer bridge daemon (production).
 
-Maintains a Watch streaming connection (presence), polls the request queue,
-routes exec/messagesOp frames to local multi-agent handlers (LangGraph live,
-AutoGen live), submits results via the official Submit endpoint.
+Transports (config: transports = ["grok", "standalone"]):
+  - grok:       Watch presence + Poll queue + Submit responses (cloud-dispatched exec frames)
+  - standalone: local HTTP entry (POST /run, GET /health, GET /ui) — Grok-independent
 
-Token is derived at runtime from the Grok Bot app's encrypted store (DPAPI +
-AES-GCM); nothing sensitive is kept in plaintext on disk.
+Quota watcher: polls GetSandUsageStatus; on hitting the threshold pops a Windows
+dialog letting you choose "switch to local models (Ollama)" or "wait for reset".
 
-Handler contract (message_json / exec serverMessageJson):
-  {"handler": "langgraph"|"autogen"|"echo", "task": "<text>"}
+Token is derived at runtime from the Grok Bot app's encrypted store; no plaintext
+secrets on disk. Handler contract: {"handler": "...", "task": "..."}.
 """
 
 import json
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
 import uuid
 
 import httpx
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge_common as bc  # noqa: E402
 
 BASE = "https://api2.cursor.sh/aiserver.v1.GrokBotService"
-LABEL = bc.config()["label"]
-LOCAL_ROOT = bc.config()["local_root"]
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "daemon.log")
-
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+_cfg = bc.config()
+LABEL = _cfg["label"]
+LOCAL_ROOT = _cfg["local_root"]
+GATEWAY = "http://127.0.0.1:18082"
+LG_DEV = "http://127.0.0.1:2024"
+AGS = "http://127.0.0.1:8081/api"
+AGS_USER = _cfg["ags_user"]
+OLLAMA_URL = _cfg.get("ollama_url", "http://192.168.50.20:11434").rstrip("/")
+OLLAMA_MODEL = _cfg.get("ollama_model", "gemma4-26b-qat-uncensored:q4km")
+QUOTA_THRESHOLD = int(_cfg.get("quota_threshold", 100))
+QUOTA_CHECK_MINUTES = int(_cfg.get("quota_check_minutes", 10))
+LOCAL_FALLBACK = bool(_cfg.get("local_fallback", True))
 
 
 def log(msg: str) -> None:
@@ -44,10 +56,7 @@ if "machine_id" not in state:
     state["machine_id"] = str(uuid.uuid4())
     bc.save_state(state)
 
-GATEWAY = "http://127.0.0.1:18082"
-LG_DEV = "http://127.0.0.1:2024"
-AGS = "http://127.0.0.1:8081/api"
-AGS_USER = bc.config()["ags_user"]
+runtime = {"quota": None, "exhausted": False, "policy": state.get("policy", "auto")}
 
 
 def bearer() -> dict:
@@ -175,14 +184,40 @@ def handle_echo(task: str) -> dict:
     return {"ok": True, "engine": "echo", "echo": task}
 
 
-HANDLERS = {"langgraph": handle_langgraph, "autogen": handle_autogen, "echo": handle_echo}
+def handle_local(task: str) -> dict:
+    """Local model (Ollama) — used when Grok quota is exhausted or explicitly chosen."""
+    payload_model = None
+    r = httpx.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": task}], "stream": False},
+        timeout=300,
+        trust_env=False,
+    )
+    r.raise_for_status()
+    text = (r.json().get("message") or {}).get("content", "")
+    return {"ok": bool(text), "engine": f"local({OLLAMA_MODEL})", "reply": text[:2000]}
+
+
+HANDLERS = {"langgraph": handle_langgraph, "autogen": handle_autogen, "echo": handle_echo, "local": handle_local}
 
 
 def dispatch(payload: dict) -> dict:
-    """Single dispatch point shared by all transports (Grok channel + standalone HTTP)."""
+    """Single dispatch point shared by all transports. Policy-aware routing."""
+    explicit = payload.get("handler")
+    if explicit:
+        handler_name = explicit
+    elif runtime["exhausted"] and runtime["policy"] == "local" and LOCAL_FALLBACK:
+        handler_name = "local"
+        log("  dispatch: quota exhausted + policy=local → routing to local model")
+    else:
+        handler_name = "echo"
+
+    handler = HANDLERS.get(handler_name)
+    if handler is None:
+        return {"bridge": LABEL, "ok": False, "error": f"unknown handler '{handler_name}'", "known": sorted(HANDLERS)}
+
     task = payload.get("task", "")
-    handler = HANDLERS.get(payload.get("handler", "echo"), handle_echo)
-    log(f"  dispatch: handler={payload.get('handler')} task={task[:60]!r}")
+    log(f"  dispatch: handler={handler_name} task={task[:60]!r}")
     try:
         result = handler(task)
     except Exception as e:
@@ -190,13 +225,98 @@ def dispatch(payload: dict) -> dict:
     return {"bridge": LABEL, **result}
 
 
-def run_handler_response(rid: str, client: dict) -> dict:
+# ---------- quota watcher + choice dialog ----------
+def toast_choice() -> None:
+    """Pop a Windows Yes/No dialog: switch to local models now?"""
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$r=[System.Windows.Forms.MessageBox]::Show("
+        "'Grok 周配额已用完（100%）。是否切换到本地模型（Ollama）继续工作？',"
+        "'Grok Bridge 配额提示','YesNo','Question',"
+        "'Button1','MessageBoxOptions.DefaultDesktopOnly');"
+        "if($r -eq 'Yes'){Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:18083/policy'"
+        " -Body '{\"mode\":\"local\"}' -ContentType 'application/json'}"
+        "else{Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:18083/policy'"
+        " -Body '{\"mode\":\"wait\"}' -ContentType 'application/json'}"
+    )
     try:
-        payload = json.loads(client.get("messageJson", "{}"))
-    except Exception:
-        payload = {"raw": client.get("messageJson", "")}
-    res = dispatch(payload)
-    return {"requestId": rid, "client": {"messageJson": json.dumps(res), "cwdState": LOCAL_ROOT}}
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            creationflags=subprocess.DETACHED_PROCESS,
+        )
+        log("[quota] choice dialog popped (Yes=local / No=wait)")
+    except Exception as e:
+        log(f"[quota] dialog failed: {e}")
+
+
+def quota_watch_loop() -> None:
+    first = True
+    while True:
+        try:
+            d = call("GetSandUsageStatus", {}) if False else httpx.post(
+                "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus",
+                headers=bearer(), json={}, timeout=30, trust_env=False,
+            ).json()
+            pct = d.get("usagePercent")
+            exhausted = pct is not None and pct >= QUOTA_THRESHOLD
+            runtime["quota"] = {
+                "usagePercent": pct,
+                "plan": d.get("grokPlanLabel"),
+                "nextReset": d.get("nextResetTimestampUtc"),
+                "exhausted": exhausted,
+                "checkedAt": time.time(),
+            }
+            if exhausted != runtime["exhausted"] or first:
+                if exhausted or first:
+                    log(f"[quota] usage={pct}% plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
+                if exhausted:
+                    toast_choice()
+            runtime["exhausted"] = exhausted
+            first = False
+        except Exception as e:
+            log(f"[quota] check failed: {type(e).__name__}: {str(e)[:80]}")
+        time.sleep(QUOTA_CHECK_MINUTES * 60)
+
+
+# ---------- grok transport ----------
+def grok_loop() -> None:
+    if not credential_valid():
+        refresh_credential()
+    log(f"machine_id: {state['machine_id']} (credential exp {state.get('credential_expires_at_ms')})")
+    threading.Thread(target=quota_watch_loop, daemon=True).start()
+    threading.Thread(target=watch_loop, args=(state["credential"],), daemon=True).start()
+    while True:
+        if not credential_valid():
+            refresh_credential()
+            log("credential refreshed")
+        poll = call(
+            "PollGrokBotUserComputerRequests",
+            {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": [], "limit": 10},
+        )
+        queued = poll.get("requests", [])
+        if queued:
+            log(f"got {len(queued)} request(s)")
+            frames, acks = [], []
+            for qr in queued:
+                try:
+                    resp = process_frame(qr)
+                    if resp:
+                        frames.append(resp)
+                    acks.append(qr["id"])
+                except Exception as e:
+                    log(f"  frame error: {e}")
+                    acks.append(qr["id"])
+            if frames:
+                r = call(
+                    "SubmitGrokBotUserComputerResponses",
+                    {"machineId": state["machine_id"], "credential": state["credential"], "frames": frames},
+                )
+                log(f"  submitted, accepted={r.get('acceptedCount')}")
+            call(
+                "PollGrokBotUserComputerRequests",
+                {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
+            )
+        time.sleep(3)
 
 
 def process_frame(qr: dict) -> dict:
@@ -223,54 +343,16 @@ def process_frame(qr: dict) -> dict:
     return {"requestId": rid, "fileError": {"resultJson": json.dumps({"error": f"bridge handles exec/messagesOp; got {kinds}"})}}
 
 
-# ---------- standalone transport (local HTTP, Grok-independent) ----------
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
-
-STANDALONE_BIND = bc.config().get("standalone_bind", "127.0.0.1")
-STANDALONE_PORT = int(bc.config().get("standalone_port", 18083))
-
-
-class StandaloneHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _json(self, code: int, obj: dict) -> None:
-        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_POST(self):  # noqa: N802
-        if self.path != "/run":
-            self._json(404, {"error": "not found (POST /run)"})
-            return
-        length = int(self.headers.get("content-length") or 0)
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            self._json(400, {"error": "invalid json"})
-            return
-        self._json(200, dispatch(payload))
-
-    def do_GET(self):  # noqa: N802
-        if self.path == "/health":
-            self._json(200, {"ok": True, "label": LABEL, "engines": sorted(HANDLERS), "transports": sorted(TRANSPORTS)})
-            return
-        self._json(404, {"error": "not found (GET /health)"})
-
-    def log_message(self, fmt, *args):  # silence stderr
-        pass
+def run_handler_response(rid: str, client: dict) -> dict:
+    try:
+        payload = json.loads(client.get("messageJson", "{}"))
+    except Exception:
+        payload = {"raw": client.get("messageJson", "")}
+    res = dispatch(payload)
+    return {"requestId": rid, "client": {"messageJson": json.dumps(res), "cwdState": LOCAL_ROOT}}
 
 
-def standalone_server() -> None:
-    srv = ThreadingHTTPServer((STANDALONE_BIND, STANDALONE_PORT), StandaloneHandler)
-    log(f"[standalone] listening on {STANDALONE_BIND}:{STANDALONE_PORT} (POST /run, GET /health)")
-    srv.serve_forever()
-
-
-# ---------- watch (presence) ----------
-def watch_loop(credential: str):
+def watch_loop(credential: str) -> None:
     while True:
         try:
             body = {"machineId": state["machine_id"], "credential": credential, "hello": HELLO}
@@ -308,61 +390,127 @@ def watch_loop(credential: str):
             time.sleep(5)
 
 
+# ---------- standalone transport + web UI ----------
+STANDALONE_BIND = _cfg.get("standalone_bind", "127.0.0.1")
+STANDALONE_PORT = int(_cfg.get("standalone_port", 18083))
+
+UI_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Grok Bridge</title>
+<style>
+body{font-family:Segoe UI,sans-serif;max-width:720px;margin:24px auto;padding:0 12px;background:#111;color:#eee}
+.card{background:#1c1c24;border-radius:10px;padding:16px;margin-bottom:16px}
+button{background:#4f6ef7;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;margin:2px}
+button.sel{background:#22c55e}
+input,textarea,select{width:100%;box-sizing:border-box;background:#0d0d12;color:#eee;border:1px solid #333;border-radius:6px;padding:8px;margin:4px 0}
+textarea{min-height:80px}
+pre{background:#0d0d12;padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-all}
+.pct{font-size:42px;font-weight:700}
+.warn{color:#f87171}.ok{color:#4ade80}
+</style></head><body>
+<h2>Grok Bridge 控制台</h2>
+<div class="card"><b>配额状态</b><div id="quota">加载中…</div>
+<div><button onclick="refreshQuota()">刷新</button>
+<button id="b-local" onclick="setPolicy('local')">切换到本地模型</button>
+<button id="b-auto" onclick="setPolicy('auto')">跟随默认</button>
+<span id="policy"></span></div></div>
+<div class="card"><b>直接派任务（不经过 Grok）</b>
+<select id="engine"><option value="local">本地模型 (Ollama)</option><option value="langgraph">LangGraph 群聊</option><option value="autogen">AutoGen 团队</option><option value="echo">echo 自检</option></select>
+<textarea id="task" placeholder="任务内容…"></textarea>
+<button onclick="run()">执行</button>
+<pre id="out">（结果）</pre></div>
+<script>
+function refreshQuota(){fetch('/quota').then(r=>r.json()).then(d=>{const q=d.quota||{};
+document.getElementById('quota').innerHTML=q.usagePercent==null?'（无数据）':
+'<span class="pct '+(q.exhausted?'warn':'ok')+'">'+q.usagePercent+'%</span> 计划: '+q.plan+'<br>重置: '+q.nextReset;
+document.getElementById('b-local').className=d.policy==='local'?'sel':'';document.getElementById('b-auto').className=d.policy!=='local'?'sel':'';
+document.getElementById('policy').textContent='当前模式: '+(d.policy==='local'?'本地模型':'跟随默认');})}
+function setPolicy(m){fetch('/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})}).then(()=>refreshQuota())}
+function run(){const e=document.getElementById('engine').value,t=document.getElementById('task').value;
+document.getElementById('out').textContent='执行中…';
+fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handler:e,task:t})}).then(r=>r.json()).then(d=>{document.getElementById('out').textContent=JSON.stringify(d,null,2)}).catch(e=>document.getElementById('out').textContent='错误: '+e)}
+refreshQuota();setInterval(refreshQuota,60000);
+</script></body></html>"""
+
+
+class StandaloneHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _json(self, code: int, obj: dict) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/run":
+            length = int(self.headers.get("content-length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            self._json(200, dispatch(payload))
+        elif self.path == "/policy":
+            length = int(self.headers.get("content-length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                mode = body.get("mode")
+                if mode not in ("local", "auto", "wait"):
+                    raise ValueError(mode)
+                runtime["policy"] = mode
+                state["policy"] = mode
+                bc.save_state(state)
+                log(f"[policy] set to {mode}")
+                self._json(200, {"ok": True, "policy": mode})
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+        else:
+            self._json(404, {"error": "not found (POST /run | /policy)"})
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/health":
+            self._json(200, {"ok": True, "label": LABEL, "engines": sorted(HANDLERS), "transports": sorted(TRANSPORTS), "policy": runtime["policy"], "quota": runtime["quota"]})
+        elif self.path == "/quota":
+            self._json(200, {"quota": runtime["quota"], "policy": runtime["policy"]})
+        elif self.path == "/ui":
+            data = UI_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self._json(404, {"error": "not found (GET /health | /quota | /ui)"})
+
+    def log_message(self, fmt, *args):  # silence stderr
+        pass
+
+
+def standalone_server() -> None:
+    srv = ThreadingHTTPServer((STANDALONE_BIND, STANDALONE_PORT), StandaloneHandler)
+    log(f"[standalone] listening on {STANDALONE_BIND}:{STANDALONE_PORT} (POST /run | /policy, GET /health | /quota | /ui)")
+    srv.serve_forever()
+
+
 # ---------- main ----------
-TRANSPORTS = set(bc.config().get("transports", ["grok", "standalone"]))
+TRANSPORTS = set(_cfg.get("transports", ["grok", "standalone"]))
 if not TRANSPORTS <= {"grok", "standalone"}:
     raise SystemExit(f"invalid transports in config: {sorted(TRANSPORTS - {'grok', 'standalone'})}")
 if not TRANSPORTS:
     raise SystemExit("no transports enabled in config (transports: [])")
 
 
-def grok_loop() -> None:
-    if not credential_valid():
-        refresh_credential()
-    log(f"machine_id: {state['machine_id']} (credential exp {state.get('credential_expires_at_ms')})")
-    threading.Thread(target=watch_loop, args=(state["credential"],), daemon=True).start()
-    while True:
-        if not credential_valid():
-            refresh_credential()
-            log("credential refreshed")
-        poll = call(
-            "PollGrokBotUserComputerRequests",
-            {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": [], "limit": 10},
-        )
-        queued = poll.get("requests", [])
-        if queued:
-            log(f"got {len(queued)} request(s)")
-            frames, acks = [], []
-            for qr in queued:
-                try:
-                    resp = process_frame(qr)
-                    if resp:
-                        frames.append(resp)
-                    acks.append(qr["id"])
-                except Exception as e:
-                    log(f"  frame error: {e}")
-                    acks.append(qr["id"])
-            if frames:
-                r = call(
-                    "SubmitGrokBotUserComputerResponses",
-                    {"machineId": state["machine_id"], "credential": state["credential"], "frames": frames},
-                )
-                log(f"  submitted, accepted={r.get('acceptedCount')}")
-            call(
-                "PollGrokBotUserComputerRequests",
-                {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
-            )
-        time.sleep(3)
-
-
 def main() -> None:
-    log(f"transports: {sorted(TRANSPORTS)}")
+    log(f"transports: {sorted(TRANSPORTS)} | policy: {runtime['policy']}")
     if "standalone" in TRANSPORTS:
         threading.Thread(target=standalone_server, daemon=True).start()
     if "grok" in TRANSPORTS:
         grok_loop()
     else:
         log("[grok] transport disabled by config; standalone-only mode")
+        if LOCAL_FALLBACK:
+            threading.Thread(target=quota_watch_loop, daemon=True).start()
         while True:
             time.sleep(3600)
 
