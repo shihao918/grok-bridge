@@ -309,14 +309,16 @@ def quota_watch_loop() -> None:
     first = True
     while True:
         try:
-            d = call("GetSandUsageStatus", {}) if False else httpx.post(
+            d = httpx.post(
                 "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus",
                 headers=bearer(), json={}, timeout=30, trust_env=False,
             ).json()
-            pct = d.get("usagePercent")
-            exhausted = pct is not None and pct >= QUOTA_THRESHOLD
+            pct = d.get("usagePercent")  # legacy weekly-percent shape (SuperGrok)
+            zero_limit = d.get("includedLimitZero") is True  # new shape: no included quota this period
+            exhausted = (pct is not None and pct >= QUOTA_THRESHOLD) or zero_limit
             runtime["quota"] = {
                 "usagePercent": pct,
+                "includedLimitZero": zero_limit,
                 "plan": d.get("grokPlanLabel"),
                 "nextReset": d.get("nextResetTimestampUtc"),
                 "exhausted": exhausted,
@@ -324,7 +326,7 @@ def quota_watch_loop() -> None:
             }
             if exhausted != runtime["exhausted"] or first:
                 if exhausted or first:
-                    log(f"[quota] usage={pct}% plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
+                    log(f"[quota] exhausted={exhausted} pct={pct} zeroLimit={zero_limit} plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
                 if exhausted:
                     toast_choice()
                 elif runtime["exhausted"] and GROK_AGENT_ID:
@@ -376,7 +378,11 @@ def grok_loop() -> None:
                     {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
                 )
         except Exception as e:
-            log(f"[grok] poll cycle error ({type(e).__name__}: {str(e)[:100]}), continuing")
+            msg = f"{type(e).__name__}: {str(e)[:100]}"
+            log(f"[grok] poll cycle error ({msg}), continuing")
+            if "401" in msg or "403" in msg:
+                time.sleep(600)  # plan-gated: back off hard, don't hammer the gate
+                continue
         time.sleep(3)
 
 
@@ -414,7 +420,9 @@ def run_handler_response(rid: str, client: dict) -> dict:
 
 
 def watch_loop(credential: str) -> None:
+    backoff = 5
     while True:
+        started = time.time()
         try:
             body = {"machineId": state["machine_id"], "credential": credential, "hello": HELLO}
             with httpx.stream(
@@ -446,9 +454,15 @@ def watch_loop(credential: str) -> None:
                             log("[watch] server acknowledged connection")
                         elif "notify" in ev:
                             log("[watch] notify received")
+                # clean stream end (server closed) — treat like a failure for backoff
+                log(f"[watch] stream ended after {time.time() - started:.1f}s")
         except Exception as e:
-            log(f"[watch] disconnected ({type(e).__name__}), retrying in 5s")
-            time.sleep(5)
+            log(f"[watch] disconnected ({type(e).__name__}: {str(e)[:80]}) after {time.time() - started:.1f}s")
+        log(f"[watch] reconnecting in {backoff}s")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+        if time.time() - started > 120:  # a healthy long-lived connection resets backoff
+            backoff = 5
 
 
 # ---------- standalone transport + web UI ----------
