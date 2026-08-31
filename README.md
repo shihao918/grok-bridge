@@ -72,6 +72,18 @@ Docs: [protocol notes](docs/protocol.md) · [writing a handler](docs/handlers.md
 
 Adding an engine is one function in `HANDLERS`.
 
+## Gateway failover
+
+`local_proxy.py` supports multiple upstreams in `state/config.json`:
+
+```json
+{"upstreams": [{"name": "primary", "url": "http://host-a/v1"}, {"name": "fallback", "url": "http://host-b/v1"}]}
+```
+
+Connect errors, timeouts, 5xx and 429 trigger automatic failover to the next
+upstream; the last healthy one is sticky. Per-upstream API keys are stored
+DPAPI-encrypted in `state/gateway_keys.bin`.
+
 ## Security model
 
 - The Grok Bot access token is **derived at runtime** from the app's encrypted store
