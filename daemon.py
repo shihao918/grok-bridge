@@ -255,7 +255,7 @@ class StandaloneHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/health":
-            self._json(200, {"ok": True, "label": LABEL, "engines": sorted(HANDLERS)})
+            self._json(200, {"ok": True, "label": LABEL, "engines": sorted(HANDLERS), "transports": sorted(TRANSPORTS)})
             return
         self._json(404, {"error": "not found (GET /health)"})
 
@@ -309,13 +309,18 @@ def watch_loop(credential: str):
 
 
 # ---------- main ----------
-def main():
+TRANSPORTS = set(bc.config().get("transports", ["grok", "standalone"]))
+if not TRANSPORTS <= {"grok", "standalone"}:
+    raise SystemExit(f"invalid transports in config: {sorted(TRANSPORTS - {'grok', 'standalone'})}")
+if not TRANSPORTS:
+    raise SystemExit("no transports enabled in config (transports: [])")
+
+
+def grok_loop() -> None:
     if not credential_valid():
         refresh_credential()
     log(f"machine_id: {state['machine_id']} (credential exp {state.get('credential_expires_at_ms')})")
-    threading.Thread(target=standalone_server, daemon=True).start()
     threading.Thread(target=watch_loop, args=(state["credential"],), daemon=True).start()
-    log("polling...")
     while True:
         if not credential_valid():
             refresh_credential()
@@ -348,6 +353,18 @@ def main():
                 {"machineId": state["machine_id"], "credential": state["credential"], "ackIds": acks, "limit": 1},
             )
         time.sleep(3)
+
+
+def main() -> None:
+    log(f"transports: {sorted(TRANSPORTS)}")
+    if "standalone" in TRANSPORTS:
+        threading.Thread(target=standalone_server, daemon=True).start()
+    if "grok" in TRANSPORTS:
+        grok_loop()
+    else:
+        log("[grok] transport disabled by config; standalone-only mode")
+        while True:
+            time.sleep(3600)
 
 
 if __name__ == "__main__":
