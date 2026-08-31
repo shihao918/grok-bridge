@@ -316,6 +316,7 @@ def quota_watch_loop() -> None:
             pct = d.get("usagePercent")  # legacy weekly-percent shape (SuperGrok)
             zero_limit = d.get("includedLimitZero") is True  # new shape: no included quota this period
             exhausted = (pct is not None and pct >= QUOTA_THRESHOLD) or zero_limit
+            episode = d.get("currentPeriodStart", "unknown")
             runtime["quota"] = {
                 "usagePercent": pct,
                 "includedLimitZero": zero_limit,
@@ -324,14 +325,28 @@ def quota_watch_loop() -> None:
                 "exhausted": exhausted,
                 "checkedAt": time.time(),
             }
-            if exhausted != runtime["exhausted"] or first:
-                if exhausted or first:
-                    log(f"[quota] exhausted={exhausted} pct={pct} zeroLimit={zero_limit} plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
-                if exhausted:
-                    toast_choice()
-                elif runtime["exhausted"] and GROK_AGENT_ID:
-                    flush_grok_queue()  # reset happened → release queued tasks
+            prev = runtime["exhausted"]
             runtime["exhausted"] = exhausted
+
+            if exhausted != prev or first:
+                log(f"[quota] exhausted={exhausted} pct={pct} zeroLimit={zero_limit} plan={d.get('grokPlanLabel')} reset={d.get('nextResetTimestampUtc')}")
+            if exhausted and not prev:
+                toast_choice() if False else None  # transition handled below (episode-aware)
+            if exhausted and not prev and GROK_AGENT_ID:
+                flush_grok_queue()
+            if not exhausted and prev and GROK_AGENT_ID:
+                flush_grok_queue()  # reset happened → release queued tasks
+
+            # episode-aware choice dialog: ask once per billing period, only if unchosen
+            chosen = state.get("policy", "auto") != "auto"
+            shown_for_episode = state.get("dialog_episode") == episode
+            if exhausted and not chosen and not shown_for_episode and not runtime.get("dialog_shown"):
+                toast_choice()
+                runtime["dialog_shown"] = True
+                state["dialog_episode"] = episode
+                bc.save_state(state)
+            if not exhausted:
+                runtime["dialog_shown"] = False  # recovered → allow asking next episode
             first = False
         except Exception as e:
             log(f"[quota] check failed: {type(e).__name__}: {str(e)[:80]}")
