@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q daemon.py bridge_common.py local_proxy.py tools/
+
+      - name: Secret scan
+        run: python scripts/secret_scan.py
+
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --quiet -r requirements.txt
+
+      - name: Import smoke test (no DPAPI on CI secrets, config defaults only)
+        run: |
+          $env:PYTHONIOENCODING = "utf-8"
+          .venv\Scripts\python.exe -c "import bridge_common; print('config defaults:', sorted(bridge_common.config().keys()))"
+          .venv\Scripts\python.exe -c "import ast; ast.parse(open('daemon.py', encoding='utf-8').read()); print('daemon.py parses')"

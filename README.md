@@ -11,17 +11,19 @@ your device — where this daemon hands the task to a **local multi-agent pipeli
 
 ## How it works
 
-```
-Grok cloud agent
-   │  exec frame (OpenGrokBotUserComputerRequest)
-   ▼
-Grok backend ──► Watch (presence) + Poll (queue) ──► daemon.py on your machine
-                                                       │ route by handler
-                                                       ├─ langgraph → LangGraph dev server (group chat)
-                                                       ├─ autogen   → AutoGen Studio team (round-robin)
-                                                       └─ echo      → self-check
-                                                       │
-Grok backend ◄── SubmitGrokBotUserComputerResponses ◄──┘
+```mermaid
+flowchart LR
+    A[Grok cloud agent] -->|exec frame| B[Grok backend]
+    B -- Watch presence + Poll queue --> D[daemon.py on your machine]
+    D --> E{route by handler}
+    E -->|langgraph| F[LangGraph group chat]
+    E -->|autogen| G[AutoGen Studio team]
+    E -->|echo| H[self-check]
+    F -->|result| D
+    G -->|result| D
+    H --> D
+    D -- Submit responses --> B
+    B -- result --> A
 ```
 
 The `exec` frame's payload is a small JSON contract:
@@ -29,6 +31,8 @@ The `exec` frame's payload is a small JSON contract:
 ```json
 {"handler": "langgraph" | "autogen" | "echo", "task": "what to do"}
 ```
+
+Docs: [protocol notes](docs/protocol.md) · [writing a handler](docs/handlers.md)
 
 ## Setup (Windows)
 
