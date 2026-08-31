@@ -17,8 +17,11 @@ SKIP_DIRS = {".git", ".venv", "state", "logs", "__pycache__", "node_modules"}
 SKIP_SUFFIX = {".png", ".jpg", ".bin", ".log"}
 
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
 def tracked_files() -> list[Path]:
-    root = Path(__file__).resolve().parent.parent
+    root = ROOT
     out = []
     for p in root.rglob("*"):
         if not p.is_file():
@@ -45,7 +48,7 @@ def main() -> int:
             for label, pat in PATTERNS.items():
                 m = pat.search(line)
                 if m:
-                    print(f"[{label}] {p.relative_to(Path.cwd())}:{line_no}: ...{m.group(0)[:24]}...")
+                    print(f"[{label}] {p.relative_to(ROOT)}:{line_no}: ...{m.group(0)[:24]}...")
                     hits += 1
     if hits:
         print(f"\nFAILED: {hits} potential secret(s) found")
