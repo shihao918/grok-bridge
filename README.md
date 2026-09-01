@@ -32,7 +32,23 @@ The `exec` frame's payload is a small JSON contract:
 {"handler": "langgraph" | "autogen" | "echo", "task": "what to do"}
 ```
 
-Docs: [protocol notes](docs/protocol.md) · [writing a handler](docs/handlers.md)
+Docs: [protocol notes](docs/protocol.md) · [writing a handler](docs/handlers.md) · [original/current diff](docs/current-vs-original-2026-09-01.md)
+
+## Local Grok Bot 0.30 gateway
+
+The local `backend_server.py` also serves the roster and transcript contracts used
+by the Grok Bot desktop app on `127.0.0.1:9000`:
+
+- `POST /api/listAgents` lists durable local Bots and group channels.
+- `POST /api/createAgent` creates a local Bot record.
+- `POST /api/createGroup` creates an internal multi-Bot channel from
+  `{"name": "...", "memberAgentIds": ["..."]}` and returns `{"agent": {"id": "..."}}`.
+- `POST /api/getAgentTranscriptTail` reads the local transcript tail.
+- `GET /health` reports local gateway health.
+
+Group channels are persisted in the ignored `state/` directory and replaying the
+same name/member request returns the existing group ID. This local gateway contract
+does not enable Discord or Slack provider connections; those remain separate work.
 
 ## Setup (Windows)
 
