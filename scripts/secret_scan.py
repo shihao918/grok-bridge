@@ -1,6 +1,7 @@
 """Scan tracked files for accidental secrets / private values. Exits 1 on any hit."""
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,12 +22,24 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def tracked_files() -> list[Path]:
-    root = ROOT
     out = []
-    for p in root.rglob("*"):
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"unable to enumerate tracked files with git: {exc}") from exc
+
+    for raw_path in result.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        rel = Path(raw_path.decode("utf-8", errors="surrogateescape"))
+        p = ROOT / rel
         if not p.is_file():
             continue
-        rel = p.relative_to(root)
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
         if p.suffix.lower() in SKIP_SUFFIX:
@@ -39,7 +52,12 @@ def tracked_files() -> list[Path]:
 
 def main() -> int:
     hits = 0
-    for p in tracked_files():
+    try:
+        files = tracked_files()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 2
+    for p in files:
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
         except OSError:

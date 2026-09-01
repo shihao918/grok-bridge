@@ -565,6 +565,14 @@ catch(err){w.textContent='错误: '+err}}
 class StandaloneHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle(self):  # noqa: A003
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browsers and local clients routinely cancel keepalive requests;
+            # suppress expected socket teardown tracebacks from the daemon.
+            return
+
     def _json(self, code: int, obj: dict) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
