@@ -3,3 +3,4 @@ logs/
 *.pyc
 __pycache__/
 .venv/
+.tmp_app_extract/
