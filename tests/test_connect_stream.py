@@ -28,6 +28,7 @@ from backend_server import (
     _proto_decode_message,
     _proto_encode_message,
     _redact_log_body,
+    _gateway_transcript_entry,
     _transcript_event,
 )
 
@@ -180,6 +181,35 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(payload["ordered"]["sequence"], 7)
         self.assertTrue(payload["ordered"]["epoch"].endswith(":3"))
 
+    def test_gateway_transcript_entry_strips_group_private_nonce_for_renderer(self):
+        entry = {
+            "seq": 2,
+            "entryKind": "message",
+            "body": backend.b64(
+                json.dumps(
+                    {
+                        "kind": "message",
+                        "role": "assistant",
+                        "content": "member reply",
+                        "clientNonce": "user-nonce",
+                        "groupPromptNonce": "group-nonce",
+                        "memberAgentId": "member-a",
+                        "authorId": "member-a",
+                        "fromAgent": {"id": "member-a", "name": "Member A"},
+                    }
+                )
+            ),
+            "updatedSeq": 2,
+            "entryId": "group-reply",
+        }
+
+        decoded = _gateway_transcript_entry("group-a", entry)
+
+        self.assertEqual(decoded["content"], "member reply")
+        self.assertEqual(decoded["fromAgent"], {"id": "member-a", "name": "Member A"})
+        self.assertNotIn("clientNonce", decoded)
+        self.assertNotIn("groupPromptNonce", decoded)
+
     def test_append_broadcasts_transcript_event_to_registered_sse_client(self):
         received = []
 
@@ -322,6 +352,24 @@ class LocalGatewayChatContractTests(unittest.TestCase):
 
         self.assertEqual(response["agent"]["origin"], "user")
         self.assertEqual(response["agent"]["harness"], "box")
+
+    def test_gateway_channel_view_endpoints_return_valid_empty_channels_view(self):
+        agent = self._post(
+            "/api/createAgent",
+            {"name": "Channel View Owner", "clientNonce": "channel-view-owner"},
+        )["agent"]
+
+        expected = {"manifests": [], "connections": []}
+        requests = [
+            ("/api/getAgentChannels", {"id": agent["id"]}),
+            ("/api/connectChannel", {"id": agent["id"], "platform": "discord", "token": "ignored"}),
+            ("/api/disconnectChannel", {"id": agent["id"], "platform": "discord"}),
+            ("/api/refreshChannel", {"id": agent["id"], "platform": "discord"}),
+        ]
+
+        for path, request in requests:
+            with self.subTest(path=path):
+                self.assertEqual(self._post(path, request), expected)
 
     def test_gateway_create_group_returns_durable_group_agent(self):
         first = self._post(
@@ -546,6 +594,16 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             replies = tail["entries"][1:]
             self.assertEqual([entry["content"] for entry in replies], ["reply-1", "reply-2"])
             self.assertEqual({entry["memberAgentId"] for entry in replies}, {first["id"], second["id"]})
+            self.assertEqual(
+                {entry["fromAgent"]["id"] for entry in replies},
+                {first["id"], second["id"]},
+            )
+            self.assertEqual(
+                {entry["fromAgent"]["name"] for entry in replies},
+                {first["name"], second["name"]},
+            )
+            self.assertTrue(all("clientNonce" not in entry for entry in replies))
+            self.assertTrue(all("groupPromptNonce" not in entry for entry in replies))
 
             acceptance = self._post(
                 "/api/promptAcceptanceStatus",
@@ -607,6 +665,10 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             self.assertEqual(len(tail["entries"]), 3)
             self.assertTrue(tail["entries"][1].get("isError"))
             self.assertEqual(tail["entries"][2]["content"], "surviving reply")
+            self.assertEqual(tail["entries"][1]["fromAgent"]["id"], first["id"])
+            self.assertEqual(tail["entries"][2]["fromAgent"]["id"], second["id"])
+            self.assertTrue(all("clientNonce" not in entry for entry in tail["entries"][1:]))
+            self.assertTrue(all("groupPromptNonce" not in entry for entry in tail["entries"][1:]))
             acceptance = self._post(
                 "/api/promptAcceptanceStatus",
                 {"agentId": group["id"], "clientNonce": nonce},
@@ -617,6 +679,82 @@ class LocalGatewayChatContractTests(unittest.TestCase):
                 set(acceptance["record"]["groupMemberResults"]),
                 {first["id"], second["id"]},
             )
+        finally:
+            backend.call_model = original_call_model
+
+    def test_group_resume_uses_private_nonce_and_skips_completed_member(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Resume First", "clientNonce": "group-resume-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Resume Second", "clientNonce": "group-resume-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Resume Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+        nonce = "group-resume-prompt"
+        backend.claim_user_prompt(group["id"], "resume group", nonce)
+        backend._commit_prompt_result(
+            group["id"],
+            "",
+            {
+                "kind": "message",
+                "role": "assistant",
+                "content": "already completed",
+                "isStreaming": False,
+                "groupPromptNonce": nonce,
+                "memberAgentId": first["id"],
+                "authorId": first["id"],
+                "fromAgent": {"id": first["id"], "name": first["name"]},
+                "timestampMs": int(time.time() * 1000),
+            },
+        )
+
+        with TRANSCRIPT_CHANGED:
+            AGENT_INDEX.clear()
+            TRANSCRIPTS.clear()
+            PROMPT_ACCEPTANCE.clear()
+        backend._load_persisted_state()
+
+        calls = []
+        original_call_model = backend.call_model
+        backend.call_model = lambda prompt: calls.append(prompt) or "resumed second"
+        try:
+            self.assertEqual(backend.resume_pending_prompts(), 1)
+
+            deadline = time.time() + 2
+            entries = []
+            while time.time() < deadline:
+                with TRANSCRIPT_CHANGED:
+                    entries = list(TRANSCRIPTS.get(group["id"], {}).get("entries", []))
+                if len(entries) >= 3:
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(len(calls), 1)
+            raw_replies = [backend._entry_body_obj(entry) for entry in entries[1:]]
+            self.assertEqual(
+                {reply["memberAgentId"] for reply in raw_replies},
+                {first["id"], second["id"]},
+            )
+            self.assertEqual(raw_replies[0]["content"], "already completed")
+            self.assertEqual(raw_replies[1]["content"], "resumed second")
+            self.assertTrue(all(reply.get("groupPromptNonce") == nonce for reply in raw_replies))
+            self.assertTrue(all("clientNonce" not in reply for reply in raw_replies))
+
+            tail = self._post(
+                "/api/getAgentTranscriptTail",
+                {"id": group["id"], "limit": 10},
+            )
+            self.assertEqual(
+                {reply["fromAgent"]["id"] for reply in tail["entries"][1:]},
+                {first["id"], second["id"]},
+            )
+            self.assertTrue(all("groupPromptNonce" not in reply for reply in tail["entries"][1:]))
+            self.assertTrue(all("clientNonce" not in reply for reply in tail["entries"][1:]))
         finally:
             backend.call_model = original_call_model
 
@@ -831,6 +969,30 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertTrue(tail["entries"][1]["id"])
         self.assertEqual(tail["entries"][1]["role"], "assistant")
         self.assertEqual(tail["entries"][1]["content"], "local echo: hello")
+
+    def test_gateway_open_agent_tail_returns_transcript_page(self):
+        agent_id = "agent-open-tail-contract-test"
+        nonce = "nonce-open-tail-contract-test"
+        self.assertEqual(
+            self._post(
+                "/api/sendPrompt",
+                {"agentId": agent_id, "prompt": "hello", "clientNonce": nonce},
+            ),
+            {"accepted": True},
+        )
+
+        deadline = time.time() + 2
+        tail = {"entries": []}
+        while time.time() < deadline:
+            tail = self._post("/api/getAgentTranscriptTail", {"id": agent_id, "limit": 10})
+            if len(tail["entries"]) >= 2:
+                break
+            time.sleep(0.05)
+
+        opened = self._post("/api/openAgentTail", {"id": agent_id, "limit": 10})
+        self.assertEqual(opened, tail)
+        self.assertEqual(opened["entries"][0]["role"], "user")
+        self.assertEqual(opened["entries"][1]["role"], "assistant")
 
     def test_concurrent_duplicate_nonce_creates_one_user_entry(self):
         agent_id = "agent-concurrent-contract-test"

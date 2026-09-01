@@ -412,6 +412,14 @@ def _group_member_ids(agent_id: str) -> list[str] | None:
         ]
 
 
+def _group_member_agent_ref(member_id: str) -> dict[str, str]:
+    """Return the minimal renderer-compatible identity for one group member."""
+    with TRANSCRIPT_CHANGED:
+        meta = AGENT_INDEX.get(member_id)
+        name = _text_field(meta.get("name"), member_id) if isinstance(meta, dict) else member_id
+    return {"id": member_id, "name": name}
+
+
 def _group_completed_members(group_id: str, client_nonce: str) -> dict[str, dict]:
     """Read durable per-member results for a group nonce before resuming work."""
     completed = {}
@@ -419,7 +427,16 @@ def _group_completed_members(group_id: str, client_nonce: str) -> dict[str, dict
         entries = list(TRANSCRIPTS.get(group_id, {}).get("entries", []))
     for entry in entries:
         body = _entry_body_obj(entry)
-        if body.get("kind") != "message" or body.get("clientNonce") != client_nonce:
+        if body.get("kind") != "message":
+            continue
+        # New group replies use a private nonce so the renderer cannot treat
+        # multiple member replies as one optimistic user echo. Accept the old
+        # clientNonce only as a read-only migration fallback for snapshots
+        # written before this compatibility fix.
+        group_nonce = body.get("groupPromptNonce")
+        if group_nonce is None:
+            group_nonce = body.get("clientNonce")
+        if group_nonce != client_nonce:
             continue
         member_id = _text_field(body.get("memberAgentId"))
         if not member_id:
@@ -449,6 +466,7 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
     for member_id in member_ids:
         if member_id in completed:
             continue
+        member_agent = _group_member_agent_ref(member_id)
         try:
             reply = call_model(_model_task(member_id, task, client_nonce))
             entry = _commit_prompt_result(
@@ -459,9 +477,10 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
                     "role": "assistant",
                     "content": reply,
                     "isStreaming": False,
-                    "clientNonce": client_nonce,
+                    "groupPromptNonce": client_nonce,
                     "memberAgentId": member_id,
                     "authorId": member_id,
+                    "fromAgent": member_agent,
                     "timestampMs": int(time.time() * 1000),
                 },
             )
@@ -482,9 +501,10 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
                         "isStreaming": False,
                         "isError": True,
                         "errorCode": "LOCAL_MODEL_ERROR",
-                        "clientNonce": client_nonce,
+                        "groupPromptNonce": client_nonce,
                         "memberAgentId": member_id,
                         "authorId": member_id,
+                        "fromAgent": member_agent,
                         "timestampMs": int(time.time() * 1000),
                     },
                 )
@@ -1846,6 +1866,13 @@ def _gateway_transcript_entry(agent_id: str, entry: dict) -> dict:
         elif not isinstance(content, str):
             body_obj["content"] = str(content)
         body_obj.setdefault("isStreaming", False)
+        # Group replies are distinct rendered messages. Do not expose their
+        # private resume nonce (or the legacy user nonce) to the 0.30
+        # renderer: `clientNonce` is an optimistic dedupe key, so sharing it
+        # with the user echo can hide member replies after hydration.
+        body_obj.pop("groupPromptNonce", None)
+        if body_obj["role"] == "assistant" and (body_obj.get("memberAgentId") or body_obj.get("authorId")):
+            body_obj.pop("clientNonce", None)
 
     return body_obj
 
@@ -1921,6 +1948,18 @@ def _agent_public(agent_id: str, meta: dict) -> dict:
         "role": meta.get("role", "assistant"),
         "viewerIsOwner": True,
     }
+
+
+def _channels_view(agent_id: str = "") -> dict:
+    """Return the local gateway's channels-view contract.
+
+    Grok Bot 0.30 hydrates the Channels tab independently from the durable
+    local Bot roster. This bridge does not own Discord/Slack provider
+    connections, but the client still requires a structurally valid
+    ``channels-view`` response; an empty object makes the resource fail and
+    triggers a retry loop in the desktop UI.
+    """
+    return {"manifests": [], "connections": []}
 
 
 def _transcript_tail(agent_id: str, limit: int, before_seq=None) -> dict:
@@ -2344,8 +2383,21 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, len(AGENT_INDEX))
             return
 
-        if self.path == "/api/getAgentTranscriptTail":
+        if self.path in {"/api/getAgentTranscriptTail", "/api/openAgentTail"}:
             self._reply(200, _transcript_tail(req.get("id"), req.get("limit"), req.get("beforeSeq")))
+            return
+
+        if self.path in {
+            "/api/getAgentChannels",
+            "/api/connectChannel",
+            "/api/disconnectChannel",
+            "/api/refreshChannel",
+        }:
+            # Provider integrations are intentionally out of scope for this
+            # local bridge. Return the valid empty channels-view shape so the
+            # 0.30 renderer can settle its resource instead of treating the
+            # generic `{}` fallback as malformed and retrying.
+            self._reply(200, _channels_view(_first_agent_id(req)))
             return
 
         if self.path == "/api/getHostStatus":
