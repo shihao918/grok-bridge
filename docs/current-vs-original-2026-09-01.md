@@ -102,5 +102,5 @@
 ## 仍然未证明或未实现
 
 - 未实现 Discord/Slack 外部 provider 的连接、刷新、断开和真实 provider 路径。
-- GUI 当前未发出 `WatchGrokBotTranscripts` 请求；历史 tail hydration 已验证，但实时 transcript watch 仍为 `HOLD/unclear`，不能据此归因是后端或渲染器失败。
+- fresh 本地日志和直连探针已看到 `WatchGrokBotTranscripts` 请求：后端返回 `200`、发送 `connected` 首帧并回放 `rows`；短探针随后主动断开。持续订阅、断线重连和 GUI 实时消息闭环仍为 `HOLD/unclear`，不能据此归因是后端或渲染器失败。
 - GitHub Actions 是否能运行需要远端新提交后的实际 CI 结果，不能用本地测试替代。
