@@ -43,12 +43,20 @@ by the Grok Bot desktop app on `127.0.0.1:9000`:
 - `POST /api/createAgent` creates a local Bot record.
 - `POST /api/createGroup` creates an internal multi-Bot channel from
   `{"name": "...", "memberAgentIds": ["..."]}` and returns `{"agent": {"id": "..."}}`.
+- `POST /api/setGroupMembers` replaces a group channel's member roster.
+- `POST /api/updateAgent` updates a Bot or channel profile (`name`, `description`,
+  `title`, `avatarShape`, and `avatarColor`).
+- `POST /api/deleteAgents` deletes user-owned Bots/channels in a batch; the
+  synthetic `bridge-agent-local` Bot and members still referenced by a channel
+  are protected.
 - `POST /api/getAgentTranscriptTail` reads the local transcript tail.
 - `GET /health` reports local gateway health.
 
 Group channels are persisted in the ignored `state/` directory and replaying the
 same name/member request returns the existing group ID. This local gateway contract
-does not enable Discord or Slack provider connections; those remain separate work.
+fans one group prompt out to each member Bot and records each result in the group
+transcript. It does not enable Discord or Slack provider connections; those remain
+separate work.
 
 ## Setup (Windows)
 

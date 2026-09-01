@@ -404,6 +404,282 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(error["memberAgentId"], "missing-agent")
         self.assertFalse(any(meta.get("isGroup") for meta in AGENT_INDEX.values()))
 
+    def test_gateway_set_group_members_replaces_roster_and_survives_reload(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "First", "clientNonce": "set-members-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Second", "clientNonce": "set-members-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Editable Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+
+        updated = self._post(
+            "/api/setGroupMembers",
+            {"id": group["id"], "memberAgentIds": [second["id"]]},
+        )
+        self.assertEqual(updated["agent"]["id"], group["id"])
+        self.assertEqual(updated["agent"]["memberIds"], [second["id"]])
+
+        with TRANSCRIPT_CHANGED:
+            AGENT_INDEX.clear()
+            TRANSCRIPTS.clear()
+            PROMPT_ACCEPTANCE.clear()
+        backend._load_persisted_state()
+
+        listed = self._post("/api/listAgents", {})
+        reloaded = next(agent for agent in listed if agent["id"] == group["id"])
+        self.assertEqual(reloaded["memberIds"], [second["id"]])
+
+    def test_gateway_set_group_members_rejects_unknown_nested_and_non_group_targets(self):
+        member = self._post(
+            "/api/createAgent",
+            {"name": "Member", "clientNonce": "set-members-validation-member"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Validation Channel", "memberAgentIds": [member["id"]]},
+        )["agent"]
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/setGroupMembers",
+                {"id": group["id"], "memberAgentIds": ["missing-member"]},
+            )
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "UNKNOWN_GROUP_MEMBER")
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/setGroupMembers",
+                {"id": group["id"], "memberAgentIds": [group["id"]]},
+            )
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "GROUP_MEMBER_NOT_ALLOWED")
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/setGroupMembers",
+                {"id": member["id"], "memberAgentIds": [member["id"]]},
+            )
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "NOT_A_GROUP")
+
+    def test_group_send_prompt_fans_out_once_per_member_and_records_acceptance(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Fanout First", "clientNonce": "fanout-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Fanout Second", "clientNonce": "fanout-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Fanout Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+        calls = []
+        original_call_model = backend.call_model
+
+        def fake_call_model(prompt):
+            calls.append(prompt)
+            return f"reply-{len(calls)}"
+
+        backend.call_model = fake_call_model
+        try:
+            nonce = "fanout-prompt-once"
+            self.assertEqual(
+                self._post(
+                    "/api/sendPrompt",
+                    {"agentId": group["id"], "prompt": "fan out", "clientNonce": nonce},
+                ),
+                {"accepted": True},
+            )
+            self.assertEqual(
+                self._post(
+                    "/api/sendPrompt",
+                    {"agentId": group["id"], "prompt": "fan out", "clientNonce": nonce},
+                ),
+                {"accepted": True},
+            )
+
+            deadline = time.time() + 2
+            tail = {"entries": []}
+            while time.time() < deadline:
+                tail = self._post(
+                    "/api/getAgentTranscriptTail",
+                    {"id": group["id"], "limit": 10},
+                )
+                if len(tail["entries"]) >= 3:
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(tail["entries"]), 3)
+            self.assertEqual(tail["entries"][0]["role"], "user")
+            replies = tail["entries"][1:]
+            self.assertEqual([entry["content"] for entry in replies], ["reply-1", "reply-2"])
+            self.assertEqual({entry["memberAgentId"] for entry in replies}, {first["id"], second["id"]})
+
+            acceptance = self._post(
+                "/api/promptAcceptanceStatus",
+                {"agentId": group["id"], "clientNonce": nonce},
+            )
+            self.assertEqual(acceptance["record"]["status"], "accepted")
+            self.assertEqual(
+                set(acceptance["record"]["groupMemberResults"]),
+                {first["id"], second["id"]},
+            )
+        finally:
+            backend.call_model = original_call_model
+
+    def test_group_send_prompt_keeps_other_members_when_one_call_fails(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Failure First", "clientNonce": "fanout-failure-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Failure Second", "clientNonce": "fanout-failure-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Partial Failure Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+        calls = []
+        original_call_model = backend.call_model
+
+        def fake_call_model(prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                raise RuntimeError("synthetic member failure")
+            return "surviving reply"
+
+        backend.call_model = fake_call_model
+        try:
+            nonce = "fanout-partial-failure"
+            self.assertEqual(
+                self._post(
+                    "/api/sendPrompt",
+                    {"agentId": group["id"], "prompt": "partial", "clientNonce": nonce},
+                ),
+                {"accepted": True},
+            )
+
+            deadline = time.time() + 2
+            tail = {"entries": []}
+            while time.time() < deadline:
+                tail = self._post(
+                    "/api/getAgentTranscriptTail",
+                    {"id": group["id"], "limit": 10},
+                )
+                if len(tail["entries"]) >= 3:
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(tail["entries"]), 3)
+            self.assertTrue(tail["entries"][1].get("isError"))
+            self.assertEqual(tail["entries"][2]["content"], "surviving reply")
+            acceptance = self._post(
+                "/api/promptAcceptanceStatus",
+                {"agentId": group["id"], "clientNonce": nonce},
+            )
+            self.assertEqual(acceptance["record"]["status"], "failed")
+            self.assertEqual(acceptance["record"]["failedMemberIds"], [first["id"]])
+            self.assertEqual(
+                set(acceptance["record"]["groupMemberResults"]),
+                {first["id"], second["id"]},
+            )
+        finally:
+            backend.call_model = original_call_model
+
+    def test_gateway_update_agent_applies_profile_and_persists(self):
+        created = self._post(
+            "/api/createAgent",
+            {
+                "name": "Original Name",
+                "description": "original description",
+                "clientNonce": "update-profile-contract-test",
+            },
+        )["agent"]
+
+        updated = self._post(
+            "/api/updateAgent",
+            {
+                "id": created["id"],
+                "profile": {
+                    "name": "Renamed Bot",
+                    "description": "updated description",
+                    "title": "Renamed title",
+                    "avatarShape": "hexagon",
+                    "avatarColor": "violet",
+                },
+            },
+        )
+        self.assertEqual(updated["agent"]["id"], created["id"])
+        self.assertEqual(updated["agent"]["name"], "Renamed Bot")
+        self.assertEqual(updated["agent"]["description"], "updated description")
+        self.assertEqual(updated["agent"]["title"], "Renamed title")
+        self.assertEqual(updated["agent"]["avatarShape"], "hexagon")
+        self.assertEqual(updated["agent"]["avatarColor"], "violet")
+
+        with TRANSCRIPT_CHANGED:
+            AGENT_INDEX.clear()
+            TRANSCRIPTS.clear()
+            PROMPT_ACCEPTANCE.clear()
+        backend._load_persisted_state()
+        listed = self._post("/api/listAgents", {})
+        reloaded = next(agent for agent in listed if agent["id"] == created["id"])
+        self.assertEqual(reloaded["name"], "Renamed Bot")
+        self.assertEqual(reloaded["description"], "updated description")
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/updateAgent",
+                {"id": created["id"], "profile": {"name": "   "}},
+            )
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "INVALID_AGENT_NAME")
+
+    def test_gateway_delete_agents_removes_batch_and_keeps_group_members_safe(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Delete First", "clientNonce": "delete-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Delete Second", "clientNonce": "delete-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Delete Guard Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post("/api/deleteAgents", {"ids": [first["id"]]})
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "AGENT_IN_USE")
+        self.assertIn(first["id"], AGENT_INDEX)
+
+        deleted = self._post("/api/deleteAgents", {"ids": [group["id"], first["id"]]})
+        self.assertEqual(deleted["deletedIds"], [group["id"], first["id"]])
+        self.assertNotIn(group["id"], AGENT_INDEX)
+        self.assertNotIn(first["id"], AGENT_INDEX)
+        self.assertIn(second["id"], AGENT_INDEX)
+
+        empty = self._post("/api/deleteAgents", {"ids": []})
+        self.assertEqual(empty, {"deletedIds": [], "agents": []})
+
     def test_gateway_create_agent_rejects_unimplemented_template_import(self):
         with self.assertRaises(urllib.error.HTTPError) as raised:
             self._post(

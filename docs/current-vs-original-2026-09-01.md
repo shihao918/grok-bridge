@@ -38,6 +38,10 @@
 - `POST /api/createGroup` 路由。
 - durable group agent 元数据：`isGroup=true`、`memberIds`、`origin=user`、`harness=box`。
 - 原子状态文件写入、`agent-upserted` 广播和基于名称/成员组合的幂等 fingerprint。
+- `POST /api/setGroupMembers` 用原子持久化替换频道成员列表，并拒绝未知成员、嵌套频道和非群组目标。
+- `POST /api/updateAgent` 更新 Bot/频道的名称、描述、标题和头像样式字段。
+- `POST /api/deleteAgents` 批量删除用户 Bot/频道；保护合成 `bridge-agent-local`，并阻止删除仍被其他频道引用的成员。
+- 群组 `sendPrompt` 会按持久化 roster 对每个成员执行一次本地模型调用，把每个结果写回群组 transcript；单成员失败会记录错误并继续其他成员。
 
 当前实际验证过的频道：
 
@@ -65,19 +69,21 @@
 
 ### 4. 测试与工具
 
-- 新增 `tests/test_connect_stream.py`，当前本地 `unittest` 共 27 个测试通过。
-- 新增频道创建成功、非法成员无副作用和幂等重放相关断言。
+- 新增 `tests/test_connect_stream.py`，当前本地 `unittest` 共 33 个测试通过。
+- 覆盖频道创建、成员替换、Bot/频道资料更新、批量删除、非法成员无副作用、幂等重放和群组 fan-out/部分失败语义。
 - 新增 `tools/download_dmg.py`、`tools/fetch_dmg_lfs.py`、`tools/resumable_dmg.py`，属于工作区已有工具候选。
 
 ## 证据
 
-- `python -m unittest tests.test_connect_stream`：27 tests，全部通过。
-- `python -m py_compile backend_server.py daemon.py scripts/secret_scan.py`：通过。
+- `python -m unittest tests.test_connect_stream`：33 tests，全部通过。
+- `python -m py_compile backend_server.py daemon.py bridge_common.py local_proxy.py`：通过。
+- `python scripts/secret_scan.py`：`secret scan clean`。
 - `git diff --check`：通过。
 - 本地 `127.0.0.1:9000/health`：HTTP 200，`{"ok": true}`。
-- 本地 `POST /api/createGroup` 重放：返回原频道 ID，群组数量不增加。
+- 本地 `POST /api/createGroup` 重放：返回原频道 ID，群组数量不增加；`setGroupMembers`、`updateAgent` 和空删除请求均已用无副作用请求验证。
+- 本地 Ollama `/api/tags` 与受控 `/api/chat` canary 均 HTTP 200；canary 返回 `CANARY_OK`。历史 state 中的旧 HTTP 500 仅作为历史错误记录，不能覆盖本次 fresh 成功。
 - `state/backend_transcript_state.json`：包含上述 group agent 元数据。
-- Grok Bot 0.30 GUI：左侧列表显示 `123`，可打开该频道。
+- Grok Bot 0.30 GUI 进程和本地 gateway 当前均在运行；已验证频道 roster/transcript 可读回和打开路径，但未做全新表单点击截图。
 
 ## 未纳入同步的内容
 
@@ -87,7 +93,6 @@
 
 ## 仍然未证明或未实现
 
-- 未证明 Discord/Slack 外部 provider 已可连接或执行。
-- 未实现 `/api/setGroupMembers`、群组编辑/删除和完整多 Bot 编排语义。
-- 本地 Ollama 返回的 HTTP 500 仍是模型执行问题，与频道创建合同分开。
+- 未实现 Discord/Slack 外部 provider 的连接、刷新、断开和真实 provider 路径。
+- 全新 GUI 表单创建尚未做视觉点击验证；当前证据是 gateway 合同和已存在频道的读回/打开路径。
 - GitHub Actions 是否能运行需要远端新提交后的实际 CI 结果，不能用本地测试替代。

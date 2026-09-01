@@ -15,8 +15,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet -r requirements.txt
+
       - name: Syntax check (compileall)
         run: python -m compileall -q daemon.py bridge_common.py local_proxy.py tools/
+
+      - name: Syntax check (backend_server.py)
+        run: python -m py_compile backend_server.py
+
+      - name: Connect stream tests
+        run: python -m unittest tests.test_connect_stream
 
       - name: Secret scan
         run: python scripts/secret_scan.py

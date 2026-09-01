@@ -396,14 +396,139 @@ def _model_task(agent_id: str, task: str, client_nonce: str = "") -> str:
     return f"Conversation history:\n{history}\n\nCurrent user message:\n{task}"
 
 
+def _group_member_ids(agent_id: str) -> list[str] | None:
+    """Return a stable non-group roster snapshot, or ``None`` for a normal Bot."""
+    with TRANSCRIPT_CHANGED:
+        meta = AGENT_INDEX.get(agent_id)
+        if not meta or not meta.get("isGroup"):
+            return None
+        # Roster validation rejects nested groups.  Re-check here so a group
+        # whose metadata is edited externally cannot dispatch into another
+        # group or a missing agent.
+        return [
+            member_id
+            for member_id in meta.get("memberIds", [])
+            if member_id in AGENT_INDEX and not AGENT_INDEX[member_id].get("isGroup")
+        ]
+
+
+def _group_completed_members(group_id: str, client_nonce: str) -> dict[str, dict]:
+    """Read durable per-member results for a group nonce before resuming work."""
+    completed = {}
+    with TRANSCRIPT_CHANGED:
+        entries = list(TRANSCRIPTS.get(group_id, {}).get("entries", []))
+    for entry in entries:
+        body = _entry_body_obj(entry)
+        if body.get("kind") != "message" or body.get("clientNonce") != client_nonce:
+            continue
+        member_id = _text_field(body.get("memberAgentId"))
+        if not member_id:
+            continue
+        completed.setdefault(
+            member_id,
+            {
+                "status": "failed" if body.get("isError") else "accepted",
+                "entryId": str(entry.get("entryId") or body.get("id") or ""),
+                **({"error": str(body.get("content") or "")} if body.get("isError") else {}),
+            },
+        )
+    return completed
+
+
+def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
+    """Fan one accepted group prompt out to each member and merge replies."""
+    member_ids = _group_member_ids(group_id) or []
+    completed = _group_completed_members(group_id, client_nonce) if client_nonce else {}
+    assistant_entry_ids = [
+        result["entryId"]
+        for result in completed.values()
+        if result.get("status") == "accepted" and result.get("entryId")
+    ]
+    failed_member_ids = [member_id for member_id, result in completed.items() if result.get("status") == "failed"]
+
+    for member_id in member_ids:
+        if member_id in completed:
+            continue
+        try:
+            reply = call_model(_model_task(member_id, task, client_nonce))
+            entry = _commit_prompt_result(
+                group_id,
+                "",
+                {
+                    "kind": "message",
+                    "role": "assistant",
+                    "content": reply,
+                    "isStreaming": False,
+                    "clientNonce": client_nonce,
+                    "memberAgentId": member_id,
+                    "authorId": member_id,
+                    "timestampMs": int(time.time() * 1000),
+                },
+            )
+            assistant_entry_ids.append(entry["entryId"])
+            completed[member_id] = {"status": "accepted", "entryId": entry["entryId"]}
+            log(f"[group-loop] {group_id[:8]} member={member_id[:8]} assistant committed ({len(reply)} chars)")
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+            failed_member_ids.append(member_id)
+            try:
+                entry = _commit_prompt_result(
+                    group_id,
+                    "",
+                    {
+                        "kind": "message",
+                        "role": "assistant",
+                        "content": f"Local model execution failed for member {member_id}: {detail}",
+                        "isStreaming": False,
+                        "isError": True,
+                        "errorCode": "LOCAL_MODEL_ERROR",
+                        "clientNonce": client_nonce,
+                        "memberAgentId": member_id,
+                        "authorId": member_id,
+                        "timestampMs": int(time.time() * 1000),
+                    },
+                )
+                completed[member_id] = {"status": "failed", "entryId": entry["entryId"], "error": detail}
+            except Exception as commit_error:
+                log(
+                    f"[group-loop] failure transcript commit error member={member_id[:8]}: "
+                    f"{type(commit_error).__name__}: {str(commit_error)[:120]}"
+                )
+                completed[member_id] = {"status": "failed", "error": detail}
+            log(f"[group-loop] member={member_id[:8]} error: {detail[:280]}")
+
+        # Persist progress after each member.  If the process crashes and the
+        # accepted nonce is resumed, transcript rows let us skip completed
+        # members without manufacturing duplicate replies.
+        if client_nonce:
+            update_prompt_acceptance(
+                group_id,
+                client_nonce,
+                groupMemberResults={member: dict(result) for member, result in completed.items()},
+            )
+
+    if client_nonce:
+        failures = [member for member in member_ids if completed.get(member, {}).get("status") == "failed"]
+        changes = {
+            "status": "failed" if failures else "accepted",
+            "completedAtMs": int(time.time() * 1000),
+            "groupMemberResults": {member: dict(result) for member, result in completed.items()},
+            "assistantEntryIds": list(assistant_entry_ids),
+            **({"failedMemberIds": failures, "rejectionCode": "LOCAL_MODEL_ERROR", "error": "one or more group members failed"} if failures else {}),
+        }
+        update_prompt_acceptance(group_id, client_nonce, **changes)
+
+
 def _submit_agent_loop(agent_id: str, task: str, client_nonce: str = "") -> None:
     """Serialize model work per agent while keeping different agents independent."""
+    group_member_ids = _group_member_ids(agent_id)
+    worker = _group_agent_loop if group_member_ids is not None else agent_loop
     with AGENT_EXECUTORS_LOCK:
         executor = AGENT_EXECUTORS.get(agent_id)
         if executor is None:
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"bridge-{agent_id[:8]}")
             AGENT_EXECUTORS[agent_id] = executor
-    executor.submit(agent_loop, agent_id, task, client_nonce)
+    executor.submit(worker, agent_id, task, client_nonce)
 
 
 def resume_pending_prompts() -> int:
@@ -641,6 +766,24 @@ def _normalize_group_member_ids(value) -> list[str]:
     return member_ids
 
 
+def _validate_group_member_ids_locked(member_ids: list[str]) -> None:
+    """Validate a group roster while ``TRANSCRIPT_CHANGED`` is held."""
+    for member_id in member_ids:
+        member = AGENT_INDEX.get(member_id)
+        if member is None:
+            raise GatewayContractError(
+                "UNKNOWN_GROUP_MEMBER",
+                "memberAgentIds contains an unknown agent id",
+                memberAgentId=member_id,
+            )
+        if member.get("isGroup"):
+            raise GatewayContractError(
+                "GROUP_MEMBER_NOT_ALLOWED",
+                "a channel cannot contain another channel",
+                memberAgentId=member_id,
+            )
+
+
 def _create_gateway_group(req: dict) -> dict:
     """Create or replay one durable 0.30 roster group."""
     name = _text_field(req.get("name"))
@@ -664,20 +807,7 @@ def _create_gateway_group(req: dict) -> dict:
                     group_id = existing_id
                     break
             else:
-                for member_id in member_ids:
-                    member = AGENT_INDEX.get(member_id)
-                    if member is None:
-                        raise GatewayContractError(
-                            "UNKNOWN_GROUP_MEMBER",
-                            "memberAgentIds contains an unknown agent id",
-                            memberAgentId=member_id,
-                        )
-                    if member.get("isGroup"):
-                        raise GatewayContractError(
-                            "GROUP_MEMBER_NOT_ALLOWED",
-                            "a channel cannot contain another channel",
-                            memberAgentId=member_id,
-                        )
+                _validate_group_member_ids_locked(member_ids)
 
                 group_id = str(uuid.uuid4())
                 meta = _default_agent_meta(group_id, name=name, description=description)
@@ -702,6 +832,189 @@ def _create_gateway_group(req: dict) -> dict:
         {"agent": group, "activeAgentId": group_id},
     )
     return {"agent": group}
+
+
+def _set_gateway_group_members(req: dict) -> dict:
+    """Replace the member roster of one durable local group channel."""
+    group_id = _text_field(req.get("id"), _text_field(req.get("agentId")))
+    if not group_id:
+        raise GatewayContractError("INVALID_AGENT_ID", "id must not be empty")
+    raw_members = req.get("memberAgentIds")
+    if raw_members is None:
+        # A few early gateway callers used the roster-facing spelling. Keep
+        # this alias harmlessly compatible while retaining one canonical wire
+        # representation in responses and persistence.
+        raw_members = req.get("memberIds")
+    member_ids = _normalize_group_member_ids(raw_members)
+
+    with TRANSCRIPT_CHANGED:
+        group = AGENT_INDEX.get(group_id)
+        if group is None:
+            raise GatewayContractError("UNKNOWN_AGENT", "agent id does not exist", agentId=group_id)
+        if not group.get("isGroup"):
+            raise GatewayContractError("NOT_A_GROUP", "setGroupMembers requires a group channel", agentId=group_id)
+        _validate_group_member_ids_locked(member_ids)
+        changed = list(group.get("memberIds", [])) != member_ids
+        if changed:
+            group["memberIds"] = list(member_ids)
+            group["updatedAtMs"] = int(time.time() * 1000)
+            _persist_state_locked()
+            TRANSCRIPT_CHANGED.notify_all()
+        public_meta = dict(group)
+
+    public = _agent_public(group_id, public_meta)
+
+    # A complete roster event is understood by the 0.30 coordinator without
+    # requiring a synthetic ordering cursor (unlike agent-upserted events).
+    if changed:
+        with TRANSCRIPT_CHANGED:
+            roster_snapshot = [(aid, dict(meta)) for aid, meta in AGENT_INDEX.items()]
+        agents = [_agent_public(aid, meta) for aid, meta in roster_snapshot]
+        _broadcast_gateway_event("agents", {"agents": agents, "activeAgentId": group_id})
+    return {"agent": public}
+
+
+def _update_gateway_agent(req: dict) -> dict:
+    """Apply the editable profile subset accepted by the 0.30 roster API."""
+    agent_id = _text_field(req.get("id"), _text_field(req.get("agentId")))
+    if not agent_id:
+        raise GatewayContractError("INVALID_AGENT_ID", "id must not be empty")
+    profile = req.get("profile")
+    if profile is None:
+        # Be tolerant of direct-field callers while keeping profile the
+        # canonical request shape emitted by the 0.30 renderer.
+        profile = req
+    if not isinstance(profile, dict):
+        raise GatewayContractError("INVALID_AGENT_PROFILE", "profile must be an object")
+
+    with TRANSCRIPT_CHANGED:
+        stored = AGENT_INDEX.get(agent_id)
+        if stored is None:
+            raise GatewayContractError("UNKNOWN_AGENT", "agent id does not exist", agentId=agent_id)
+        updates = {}
+        if "name" in profile:
+            name = _text_field(profile.get("name"))
+            if not name:
+                raise GatewayContractError("INVALID_AGENT_NAME", "name must not be empty")
+            updates["name"] = name
+        if "description" in profile:
+            description = profile.get("description")
+            if not isinstance(description, str):
+                raise GatewayContractError("INVALID_AGENT_DESCRIPTION", "description must be a string")
+            updates["description"] = description.strip()
+        if "title" in profile:
+            title = _text_field(profile.get("title"))
+            if title:
+                updates["title"] = title
+        for key in ("avatarShape", "avatarColor"):
+            if key in profile:
+                value = profile.get(key)
+                if not isinstance(value, str):
+                    raise GatewayContractError("INVALID_AGENT_PROFILE", f"{key} must be a string")
+                updates[key] = value.strip()
+
+        changed = False
+        for key, value in updates.items():
+            if stored.get(key) != value:
+                stored[key] = value
+                changed = True
+        if changed:
+            stored["updatedAtMs"] = int(time.time() * 1000)
+            _persist_state_locked()
+            TRANSCRIPT_CHANGED.notify_all()
+        public_meta = dict(stored)
+
+    public = _agent_public(agent_id, public_meta)
+
+    if changed:
+        with TRANSCRIPT_CHANGED:
+            roster_snapshot = [(aid, dict(meta)) for aid, meta in AGENT_INDEX.items()]
+        agents = [_agent_public(aid, meta) for aid, meta in roster_snapshot]
+        _broadcast_gateway_event("agents", {"agents": agents, "activeAgentId": agent_id})
+    return {"agent": public}
+
+
+def _delete_gateway_agents(req: dict) -> dict:
+    """Delete a batch of local agents without leaving dangling group rosters."""
+    value = req.get("ids")
+    if value is None:
+        value = req.get("agentIds")
+    if value is None:
+        raise GatewayContractError("INVALID_AGENT_IDS", "ids must be an array of agent ids")
+    if not isinstance(value, list):
+        raise GatewayContractError("INVALID_AGENT_IDS", "ids must be an array of agent ids")
+    ids = []
+    seen = set()
+    for raw_id in value:
+        agent_id = _text_field(raw_id)
+        if not agent_id:
+            raise GatewayContractError("INVALID_AGENT_IDS", "ids must contain only non-empty agent ids")
+        if agent_id not in seen:
+            seen.add(agent_id)
+            ids.append(agent_id)
+    if not ids:
+        return {"deletedIds": [], "agents": []}
+
+    with TRANSCRIPT_CHANGED:
+        unknown = [agent_id for agent_id in ids if agent_id not in AGENT_INDEX]
+        if unknown:
+            raise GatewayContractError("UNKNOWN_AGENT", "ids contains an unknown agent id", agentId=unknown[0])
+        if "bridge-agent-local" in ids:
+            raise GatewayContractError(
+                "PROTECTED_AGENT",
+                "the local bridge agent cannot be deleted",
+                agentId="bridge-agent-local",
+            )
+        deleted_groups = {agent_id for agent_id in ids if AGENT_INDEX[agent_id].get("isGroup")}
+        in_use = []
+        for candidate in ids:
+            if candidate in deleted_groups:
+                continue
+            owners = [
+                group_id
+                for group_id, meta in AGENT_INDEX.items()
+                if meta.get("isGroup") and group_id not in deleted_groups and candidate in meta.get("memberIds", [])
+            ]
+            if owners:
+                in_use.append((candidate, owners[0]))
+        if in_use:
+            candidate, owner = in_use[0]
+            raise GatewayContractError(
+                "AGENT_IN_USE",
+                "agent is still a member of a group channel",
+                agentId=candidate,
+                groupId=owner,
+            )
+
+        for agent_id in ids:
+            AGENT_INDEX.pop(agent_id, None)
+            TRANSCRIPTS.pop(agent_id, None)
+            for key in [key for key in PROMPT_ACCEPTANCE if key[0] == agent_id]:
+                PROMPT_ACCEPTANCE.pop(key, None)
+        _persist_state_locked()
+        TRANSCRIPT_CHANGED.notify_all()
+
+    # Stop per-agent workers and remove avatar files after durable state has
+    # committed; these operations are best-effort cleanup and never roll back
+    # a successful metadata deletion.
+    with AGENT_EXECUTORS_LOCK:
+        executors = [AGENT_EXECUTORS.pop(agent_id, None) for agent_id in ids]
+    for executor in executors:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+    for agent_id in ids:
+        try:
+            avatar_path = _avatar_path(agent_id)
+            if os.path.exists(avatar_path):
+                os.unlink(avatar_path)
+        except OSError:
+            pass
+
+    with TRANSCRIPT_CHANGED:
+        roster_snapshot = [(aid, dict(meta)) for aid, meta in AGENT_INDEX.items()]
+    agents = [_agent_public(aid, meta) for aid, meta in roster_snapshot]
+    _broadcast_gateway_event("agents", {"agents": agents, "activeAgentId": None})
+    return {"deletedIds": ids, "agents": agents}
 
 
 def _avatar_path(agent_id: str) -> str:
@@ -2074,6 +2387,33 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/createGroup":
             try:
                 response = _create_gateway_group(req)
+            except GatewayContractError as exc:
+                self._reply(exc.status, exc.payload)
+                return
+            self._reply(200, response)
+            return
+
+        if self.path == "/api/setGroupMembers":
+            try:
+                response = _set_gateway_group_members(req)
+            except GatewayContractError as exc:
+                self._reply(exc.status, exc.payload)
+                return
+            self._reply(200, response)
+            return
+
+        if self.path == "/api/updateAgent":
+            try:
+                response = _update_gateway_agent(req)
+            except GatewayContractError as exc:
+                self._reply(exc.status, exc.payload)
+                return
+            self._reply(200, response)
+            return
+
+        if self.path == "/api/deleteAgents":
+            try:
+                response = _delete_gateway_agents(req)
             except GatewayContractError as exc:
                 self._reply(exc.status, exc.payload)
                 return
