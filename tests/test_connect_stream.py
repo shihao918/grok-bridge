@@ -472,6 +472,25 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         error = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual(error["code"], "NOT_A_GROUP")
 
+    def test_gateway_set_group_members_does_not_materialize_unknown_target(self):
+        member = self._post(
+            "/api/createAgent",
+            {"name": "Known Member", "clientNonce": "set-members-unknown-target-member"},
+        )["agent"]
+        unknown_id = "missing-group-target"
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/setGroupMembers",
+                {"id": unknown_id, "memberAgentIds": [member["id"]]},
+            )
+
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "UNKNOWN_AGENT")
+        self.assertNotIn(unknown_id, AGENT_INDEX)
+        self.assertNotIn(unknown_id, TRANSCRIPTS)
+
     def test_group_send_prompt_fans_out_once_per_member_and_records_acceptance(self):
         first = self._post(
             "/api/createAgent",
@@ -649,6 +668,21 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 400)
         error = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual(error["code"], "INVALID_AGENT_NAME")
+
+    def test_gateway_update_agent_does_not_materialize_unknown_target(self):
+        unknown_id = "missing-update-target"
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self._post(
+                "/api/updateAgent",
+                {"id": unknown_id, "profile": {"name": "Should Not Exist"}},
+            )
+
+        self.assertEqual(raised.exception.code, 400)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "UNKNOWN_AGENT")
+        self.assertNotIn(unknown_id, AGENT_INDEX)
+        self.assertNotIn(unknown_id, TRANSCRIPTS)
 
     def test_gateway_delete_agents_removes_batch_and_keeps_group_members_safe(self):
         first = self._post(

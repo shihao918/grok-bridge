@@ -2318,6 +2318,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/") and self.path not in {
             "/api/createAgent",
             "/api/createAgentFromTemplate",
+            "/api/setGroupMembers",
+            "/api/updateAgent",
             "/api/setAgentAvatarBytes",
         }:
             agent_id = _first_agent_id(req)
