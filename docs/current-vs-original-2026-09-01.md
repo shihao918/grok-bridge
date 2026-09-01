@@ -6,6 +6,8 @@
 
 候选分支：`codex/grok-bot-0.30-channel-create-20260901`
 
+本轮代码变更提交：`b417cf2c3054097008bfb96a4ffdbd240f66aff6`
+
 ## 结论
 
 当前工作区已经从“只提供少量沙箱/流式试验接口”的后端，扩展为可被 Grok Bot 0.30 本地桌面端读取和写入的本地桥接后端。
@@ -41,7 +43,10 @@
 - `POST /api/setGroupMembers` 用原子持久化替换频道成员列表，并拒绝未知成员、嵌套频道和非群组目标。
 - `POST /api/updateAgent` 更新 Bot/频道的名称、描述、标题和头像样式字段；未知目标会直接返回合同错误，不会被自动物化成 Bot。
 - `POST /api/deleteAgents` 批量删除用户 Bot/频道；保护合成 `bridge-agent-local`，并阻止删除仍被其他频道引用的成员。
+- `POST /api/openAgentTail` 复用 transcript tail 返回结构，供桌面端打开频道时回填历史消息。
+- `POST /api/getAgentChannels`、`/api/connectChannel`、`/api/disconnectChannel`、`/api/refreshChannel` 返回合法的 `channels-view` 空结构，避免客户端把 `{}` 视为 malformed；这些接口当前是 provider 兼容 no-op，不代表 Discord/Slack 已连接。
 - 群组 `sendPrompt` 会按持久化 roster 顺序用有界串行 worker 对每个成员执行一次本地模型调用，把每个结果写回群组 transcript；单成员失败会记录错误并继续其他成员，短调用窗口可能先于全部成员完成。
+- 群组 assistant 回复使用内部 `groupPromptNonce` 支持崩溃恢复，并输出 `fromAgent: {id, name}`；渲染出口会移除私有 nonce 和旧的 group `clientNonce`，避免多个成员回复被 optimistic dedupe 折叠。
 
 当前实际验证过的频道：
 
@@ -69,23 +74,24 @@
 
 ### 4. 测试与工具
 
-- 新增 `tests/test_connect_stream.py`，当前本地 `unittest` 共 35 个测试通过。
-- 覆盖频道创建、成员替换、Bot/频道资料更新、批量删除、非法成员无副作用、幂等重放和群组 fan-out/部分失败语义。
+- 新增 `tests/test_connect_stream.py`，当前本地 `unittest` 共 39 个测试通过。
+- 覆盖频道创建、成员替换、Bot/频道资料更新、批量删除、非法成员无副作用、幂等重放、频道 `channels-view`、transcript hydration、群组 fan-out/部分失败和崩溃恢复语义。
 - 工作区还存在 `tools/download_dmg.py`、`tools/fetch_dmg_lfs.py`、`tools/resumable_dmg.py` 三个未跟踪文件；它们不属于本次提交或当前远端能力，未纳入同步。
 
 ## 证据
 
-- `python -m unittest tests.test_connect_stream`：35 tests，全部通过（15.676s）。
-- `python -m py_compile backend_server.py daemon.py bridge_common.py local_proxy.py`：通过。
+- `.venv\\Scripts\\python.exe -m unittest -v tests.test_connect_stream`：39 tests，全部通过。
+- `python -m py_compile backend_server.py tests/test_connect_stream.py`：通过。
 - `python scripts/secret_scan.py`：`secret scan clean`。
 - `git diff --check`：通过。
 - 本地 `127.0.0.1:9000/health`：HTTP 200，`{"ok": true}`。
+- 本地 GUI 已验证创建内部频道、自动选中和重载后持久化读回；频道 `555` 的历史 transcript 已验证为 1 条用户消息加 4 条 assistant 回复。
 - 本地 `POST /api/createGroup` 重放：返回原频道 ID，群组数量不增加；`setGroupMembers`、`updateAgent` 和空删除请求均已用无副作用请求验证。
 - fresh current-process fan-out 日志证明双成员调用均返回并写回 transcript；这只证明本地后端执行轨迹。Ollama 通用稳定性、响应体、清理后的 durable state 以及外部 provider/runtime truth 仍未证明。
 - fresh gateway 进程（PID `103716`，提交后启动）已完成双成员 group fan-out canary：两个成员分别产出 `[group-loop]` 结果并写入 transcript；随后仅清理该次探针对象。该证据证明本地后端 fan-out 迹线，不证明 GUI 视觉闭环或外部 provider/runtime truth。
 - `state/backend_transcript_state.json`：包含上述 group agent 元数据。
 - `state/backend_transcript_state.json` 当前读回 10 个 Agent、3 个 `123` 群组和 9 条终态 acceptance（8 accepted、1 `LOCAL_MODEL_ERROR` failed，无 pending）；同名对象 fingerprint 均唯一，来源仍未完全归因。
-- Grok Bot 0.30 GUI 进程和本地 gateway 当前均在运行；已验证 roster、菜单和“新建频道”表单可见且创建按钮初始禁用。提交时检测到用户输入接管，按安全边界停止，因此全新表单的点击→API→持久化闭环仍未验证。
+- Grok Bot 0.30 GUI 进程和本地 gateway 当前均在运行；已验证新建频道表单的点击→`/api/createGroup`→持久化→自动选中→重载读回闭环。
 
 ## 未纳入同步的内容
 
@@ -96,5 +102,5 @@
 ## 仍然未证明或未实现
 
 - 未实现 Discord/Slack 外部 provider 的连接、刷新、断开和真实 provider 路径。
-- 全新 GUI 表单的提交闭环尚未验证；表单渲染和可访问性已验证，但本轮因用户接管焦点未发送 `POST /api/createGroup`，没有可归因的创建请求、HTTP 响应或新频道读回证据。
+- GUI 当前未发出 `WatchGrokBotTranscripts` 请求；历史 tail hydration 已验证，但实时 transcript watch 仍为 `HOLD/unclear`，不能据此归因是后端或渲染器失败。
 - GitHub Actions 是否能运行需要远端新提交后的实际 CI 结果，不能用本地测试替代。

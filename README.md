@@ -52,6 +52,12 @@ by the Grok Bot desktop app on `127.0.0.1:9000`:
   synthetic `bridge-agent-local` Bot and members still referenced by a channel
   are protected.
 - `POST /api/getAgentTranscriptTail` reads the local transcript tail.
+- `POST /api/openAgentTail` returns the same transcript page shape for desktop
+  channel hydration when a channel is opened.
+- `POST /api/getAgentChannels` returns the local `channels-view` contract.
+- `POST /api/connectChannel`, `/api/disconnectChannel`, and `/api/refreshChannel`
+  currently return a structurally valid empty `channels-view`; they are
+  compatibility no-ops, not Discord/Slack provider connections.
 - `POST /api/promptAcceptanceStatus` reads the terminal acceptance record for a
   `clientNonce`, including per-member group results and failures.
 - `GET /health` reports local gateway health.
@@ -61,9 +67,11 @@ same name/member request returns the existing group ID. This local gateway contr
 fans one group prompt out to each member Bot in roster order using a bounded serial
 worker. Each member result is written to the group transcript; one member failure is
 isolated so later members still run. The acceptance record keeps per-member status and
-supports exactly-once replay by `clientNonce`. Serial local-model latency can exceed a
-short caller wait window. It does not enable Discord or Slack provider connections;
-those remain separate work.
+supports exactly-once replay by `clientNonce`. Group assistant rows carry a private
+`groupPromptNonce` for crash recovery and a renderer-compatible `fromAgent` identity;
+both the private nonce and legacy group `clientNonce` are removed at the gateway
+rendering boundary. Serial local-model latency can exceed a short caller wait window.
+This does not enable Discord or Slack provider connections; those remain separate work.
 
 ## Setup (Windows)
 
