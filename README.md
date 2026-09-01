@@ -44,19 +44,26 @@ by the Grok Bot desktop app on `127.0.0.1:9000`:
 - `POST /api/createGroup` creates an internal multi-Bot channel from
   `{"name": "...", "memberAgentIds": ["..."]}` and returns `{"agent": {"id": "..."}}`.
 - `POST /api/setGroupMembers` replaces a group channel's member roster.
+- Unknown `setGroupMembers`/`updateAgent` targets return `400 UNKNOWN_AGENT`; they are
+  rejected without materializing a new Bot or changing the state file.
 - `POST /api/updateAgent` updates a Bot or channel profile (`name`, `description`,
   `title`, `avatarShape`, and `avatarColor`).
 - `POST /api/deleteAgents` deletes user-owned Bots/channels in a batch; the
   synthetic `bridge-agent-local` Bot and members still referenced by a channel
   are protected.
 - `POST /api/getAgentTranscriptTail` reads the local transcript tail.
+- `POST /api/promptAcceptanceStatus` reads the terminal acceptance record for a
+  `clientNonce`, including per-member group results and failures.
 - `GET /health` reports local gateway health.
 
 Group channels are persisted in the ignored `state/` directory and replaying the
 same name/member request returns the existing group ID. This local gateway contract
-fans one group prompt out to each member Bot and records each result in the group
-transcript. It does not enable Discord or Slack provider connections; those remain
-separate work.
+fans one group prompt out to each member Bot in roster order using a bounded serial
+worker. Each member result is written to the group transcript; one member failure is
+isolated so later members still run. The acceptance record keeps per-member status and
+supports exactly-once replay by `clientNonce`. Serial local-model latency can exceed a
+short caller wait window. It does not enable Discord or Slack provider connections;
+those remain separate work.
 
 ## Setup (Windows)
 
@@ -78,6 +85,7 @@ separate work.
    python -m venv .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    start_proxy.cmd   &   start_daemon.cmd
+   .venv\Scripts\python.exe -u backend_server.py
    ```
 
 5. Send a test task:

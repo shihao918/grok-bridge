@@ -1,5 +1,9 @@
 # UserComputer channel — protocol notes
 
+本文只描述远程 ConnectRPC/UserComputer 通道。仓库 README 和
+`docs/current-vs-original-2026-09-01.md` 中的 `/api/*` 是本地 `backend_server.py`
+gateway 合同，不能与下述远程服务混读。
+
 Observed on **Grok Bot desktop 0.30.0** (Windows). Everything below was derived from
 static analysis of the shipped bundles and live traffic against `https://api2.cursor.sh`
 using a personally logged-in account. Unofficial, may change at any time.
