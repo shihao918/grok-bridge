@@ -24,6 +24,7 @@ from backend_server import (
     _PROTO_SCHEMAS,
     _broadcast_transcript_event,
     _first_agent_id,
+    _resolve_agent_id,
     _observe_sand_machine,
     _proto_decode_message,
     _proto_encode_message,
@@ -31,6 +32,62 @@ from backend_server import (
     _gateway_transcript_entry,
     _transcript_event,
 )
+
+
+GATEWAY_AGENT_REQUIRED_FIELDS_036 = {
+    "avatarDataUrl",
+    "awaitingUserResponse",
+    "createdAt",
+    "description",
+    "hasUnread",
+    "id",
+    "isActive",
+    "isComposingMessage",
+    "isGroup",
+    "isRunning",
+    "lastEntry",
+    "lastMessageId",
+    "memberIds",
+    "name",
+    "notificationsEnabled",
+    "notifyOnUpdatesEnabled",
+    "origin",
+    "path",
+    "updatedAt",
+}
+
+GATEWAY_AGENT_ALLOWED_FIELDS_036 = GATEWAY_AGENT_REQUIRED_FIELDS_036 | {
+    "activeGroupMemberId",
+    "avatarColor",
+    "avatarShape",
+    "avatarVersion",
+    "boxHandoff",
+    "currentActivity",
+    "harness",
+    "isHiddenFromSidebar",
+    "isRetrying",
+    "isRunningTurn",
+    "lastActivityAt",
+    "lastMessageAuthorId",
+    "lastMessagePreview",
+    "lastMessagePreviewSource",
+    "lastTurnSettlement",
+    "newestEntryId",
+    "purpose",
+    "pushMessageContent",
+    "runningSessionIds",
+    "serverId",
+    "slackConnected",
+    "snapshotEpoch",
+    "snapshotSeq",
+    "teamId",
+    "title",
+    "unreadCount",
+    "viewerIsOwner",
+    "viewerSessionId",
+    "visibility",
+    "voiceId",
+}
 
 
 class ConnectStreamFramingTests(unittest.TestCase):
@@ -102,6 +159,96 @@ class ConnectStreamFramingTests(unittest.TestCase):
 
         self.assertEqual(decoded, {"machines": [machine]})
 
+    def test_transcript_replay_advances_cursor_before_live_wait(self):
+        original_condition = backend.TRANSCRIPT_CHANGED
+        original_time = backend.time
+        original_log = backend.log
+        original_agents = backend.AGENT_INDEX
+        original_transcripts = backend.TRANSCRIPTS
+
+        class FakeClock:
+            def __init__(self):
+                self.value = 0
+
+            def monotonic(self):
+                return self.value
+
+            def time(self):
+                return self.value
+
+            def strftime(self, *_args):
+                return "00:00:00"
+
+        class ImmediateCondition:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def wait(self, timeout=None):
+                del timeout
+                clock.value = 15
+
+        class StopStream(Exception):
+            pass
+
+        clock = FakeClock()
+        frames = []
+        agent_id = "agent-replay"
+        entry = {
+            "seq": 1,
+            "updatedSeq": 1,
+            "entryKind": "message",
+            "entryId": "entry-replay",
+            "body": backend.b64(
+                json.dumps(
+                    {
+                        "kind": "message",
+                        "role": "assistant",
+                        "content": "replay",
+                        "id": "entry-replay",
+                    }
+                )
+            ),
+        }
+        backend.AGENT_INDEX = {agent_id: {}}
+        backend.TRANSCRIPTS = {
+            agent_id: {"generation": 1, "next_seq": 2, "entries": [entry]}
+        }
+        backend.TRANSCRIPT_CHANGED = ImmediateCondition()
+        backend.time = clock
+        backend.log = lambda _message: None
+
+        handler = object.__new__(Handler)
+        handler._request_is_stream_proto = lambda: False
+        handler._connect_stream_start = lambda: None
+
+        def write_frame(frame):
+            frames.append(frame)
+            if "heartbeat" in frame:
+                raise StopStream()
+
+        handler._connect_stream_write = write_frame
+
+        try:
+            with self.assertRaises(StopStream):
+                Handler._watch_transcripts(
+                    handler,
+                    b'{"cursors":[],"includeUnlistedAgents":true}',
+                )
+        finally:
+            backend.TRANSCRIPT_CHANGED = original_condition
+            backend.time = original_time
+            backend.log = original_log
+            backend.AGENT_INDEX = original_agents
+            backend.TRANSCRIPTS = original_transcripts
+
+        rows = [frame["rows"] for frame in frames if "rows" in frame]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(all(row["replay"] is True for row in rows))
+        self.assertEqual([row["agentId"] for row in rows], [agent_id])
+
     def test_restored_agent_id_is_read_from_json_and_query_shapes(self):
         agent_id = "01d0a188-7ac0-4508-b0a4-1d95e155fae4"
 
@@ -115,6 +262,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
     def setUp(self):
         self.original_persistence_file = backend.PERSISTENCE_FILE
         self.original_avatar_dir = backend.AVATAR_DIR
+        self.original_host_settings = backend._host_settings_snapshot()
         self.persistence_dir = tempfile.TemporaryDirectory()
         backend.PERSISTENCE_FILE = os.path.join(self.persistence_dir.name, "backend_transcript_state.json")
         backend.AVATAR_DIR = os.path.join(self.persistence_dir.name, "agent_avatars")
@@ -123,6 +271,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             TRANSCRIPTS.clear()
             PROMPT_ACCEPTANCE.clear()
             SSE_SUBSCRIBERS.clear()
+            backend.USER_COMPUTER_PRESENCE.clear()
         self.original_call_model = backend.call_model
         backend.call_model = lambda prompt: f"local echo: {prompt}"
         self.server = backend.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -141,11 +290,15 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             executor.shutdown(wait=True, cancel_futures=True)
         backend.call_model = self.original_call_model
         backend.AVATAR_DIR = self.original_avatar_dir
+        with backend.HOST_SETTINGS_LOCK:
+            backend.HOST_SETTINGS.clear()
+            backend.HOST_SETTINGS.update(self.original_host_settings)
         with TRANSCRIPT_CHANGED:
             AGENT_INDEX.clear()
             TRANSCRIPTS.clear()
             PROMPT_ACCEPTANCE.clear()
             SSE_SUBSCRIBERS.clear()
+            backend.USER_COMPUTER_PRESENCE.clear()
         backend.PERSISTENCE_FILE = self.original_persistence_file
         self.persistence_dir.cleanup()
 
@@ -181,6 +334,29 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(payload["ordered"]["sequence"], 7)
         self.assertTrue(payload["ordered"]["epoch"].endswith(":3"))
 
+    def test_native_dev_login_mints_camel_case_local_session(self):
+        session = self._get("/auth/cursor_dev_session_token?plan=ultra&email=bridge%40local")
+
+        self.assertTrue(session["accessToken"])
+        self.assertTrue(session["refreshToken"])
+        self.assertEqual(session["email"], "bridge@local")
+        self.assertEqual(session["plan"], "ultra")
+        self.assertNotIn("access_token", session)
+        self.assertNotIn("refresh_token", session)
+
+        payload = json.loads(backend.b64url_dec(session["accessToken"].split(".")[1]).decode("utf-8"))
+        self.assertEqual(payload["sub"], "grok|bridge-user")
+        self.assertEqual(payload["email"], "bridge@local")
+
+        refreshed = self._post(
+            "/oauth/token",
+            {"refresh_token": session["refreshToken"]},
+        )
+        self.assertTrue(refreshed["access_token"])
+        refreshed_payload = json.loads(backend.b64url_dec(refreshed["access_token"].split(".")[1]).decode("utf-8"))
+        self.assertEqual(refreshed_payload["sub"], "grok|bridge-user")
+        self.assertEqual(refreshed_payload["email"], "bridge@local")
+
     def test_gateway_transcript_entry_strips_group_private_nonce_for_renderer(self):
         entry = {
             "seq": 2,
@@ -208,6 +384,32 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(decoded["content"], "member reply")
         self.assertEqual(decoded["fromAgent"], {"id": "member-a", "name": "Member A"})
         self.assertNotIn("clientNonce", decoded)
+        self.assertNotIn("groupPromptNonce", decoded)
+
+    def test_native_wire_entry_rehydrates_legacy_group_member_identity(self):
+        member = self._post(
+            "/api/createAgent",
+            {"name": "Legacy Member", "clientNonce": "legacy-wire-member"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Legacy Wire Channel", "memberAgentIds": [member["id"]]},
+        )["agent"]
+        raw = backend.append_entry(
+            group["id"],
+            "message",
+            {
+                "kind": "message",
+                "role": "assistant",
+                "content": "old row",
+                "memberAgentId": member["id"],
+                "authorId": member["id"],
+            },
+        )
+
+        wire = backend._transcript_wire_entry(group["id"], raw)
+        decoded = json.loads(base64.b64decode(wire["body"]).decode("utf-8"))
+        self.assertEqual(decoded["fromAgent"], {"id": member["id"], "name": member["name"]})
         self.assertNotIn("groupPromptNonce", decoded)
 
     def test_append_broadcasts_transcript_event_to_registered_sse_client(self):
@@ -255,6 +457,25 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=5) as response:
             self.assertEqual(response.headers.get_content_type(), "application/proto")
             return _proto_decode_message(response.read(), response_schema)
+
+    def assert_gateway_agent_summary_036(self, agent):
+        self.assertIsInstance(agent, dict)
+        keys = set(agent)
+        self.assertFalse(
+            GATEWAY_AGENT_REQUIRED_FIELDS_036 - keys,
+            f"missing 0.36 fields: {sorted(GATEWAY_AGENT_REQUIRED_FIELDS_036 - keys)}",
+        )
+        self.assertFalse(
+            keys - GATEWAY_AGENT_ALLOWED_FIELDS_036,
+            f"unexpected 0.36 fields: {sorted(keys - GATEWAY_AGENT_ALLOWED_FIELDS_036)}",
+        )
+        self.assertIsInstance(agent["avatarDataUrl"], (str, type(None)))
+        self.assertIsInstance(agent["isActive"], bool)
+        self.assertIsInstance(agent["isComposingMessage"], bool)
+        self.assertIsInstance(agent["isRunning"], bool)
+        self.assertIn(agent["origin"], {"dev", "user"})
+        if "harness" in agent:
+            self.assertEqual(agent["harness"], "temporal")
 
     def test_create_agent_returns_valid_box_harness_and_is_listed(self):
         agent_id = "agent-create-contract-test"
@@ -309,6 +530,143 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertFalse(capabilities.get("temporalCreationEnabled", False))
         self.assertTrue(capabilities["agentMessagingEnabled"])
 
+    def test_gateway_host_settings_match_036_contract_and_accept_updates(self):
+        settings = self._post("/api/getHostSettings", {})
+
+        self.assertEqual(
+            set(settings),
+            {
+                "autoReviewInstructions",
+                "hasSeenOnboarding",
+                "localToolPermission",
+                "mcpBoxServers",
+                "mcpCustomInstructions",
+                "mcpCustomInstructionsByServerId",
+                "mcpDisabledToolsByServerId",
+                "mcpHeldAccountScopes",
+                "notifications",
+                "pinnedAgentIds",
+                "sidebarSections",
+                "webauthnProxyEnabled",
+            },
+        )
+        self.assertEqual(
+            settings["autoReviewInstructions"],
+            {"allowInstructions": [], "blockInstructions": [], "isEnabled": False},
+        )
+        self.assertEqual(
+            set(settings["notifications"]),
+            {"allowedApps", "isEnabled", "maxPerWindow", "minIntervalMs", "windowMs"},
+        )
+
+        updated = self._post(
+            "/api/setHostSettings",
+            {
+                "autoReviewInstructions": {
+                    "allowInstructions": ["safe local command"],
+                    "blockInstructions": ["external provider"],
+                    "isEnabled": True,
+                },
+                "notifications": {"isEnabled": True},
+                "pinnedAgentIds": ["agent-settings-test"],
+            },
+        )
+        self.assertTrue(updated["autoReviewInstructions"]["isEnabled"])
+        self.assertEqual(updated["notifications"]["allowedApps"], [])
+        self.assertTrue(updated["notifications"]["isEnabled"])
+        self.assertEqual(updated["pinnedAgentIds"], ["agent-settings-test"])
+
+    def test_native_user_computer_unary_contracts_are_typed_and_empty(self):
+        machine_id = "local-machine-contract"
+        hello = {
+            "label": "Local contract test",
+            "localRoot": "C:/workspace",
+            "standing": "supervised",
+            "supervised": True,
+        }
+        with backend.LOCK:
+            backend.USER_COMPUTER_PRESENCE[machine_id] = {
+                "machineId": machine_id,
+                "hello": hello,
+                "lastSeenAtMs": 123,
+            }
+
+        listed = self._post_proto(
+            "/aiserver.v1.GrokBotService/ListGrokBotUserComputers",
+            {},
+            {},
+            _PROTO_SCHEMAS["computer_list_resp"],
+        )
+        self.assertEqual(listed["computers"][0]["machineId"], machine_id)
+        self.assertEqual(listed["computers"][0]["hello"]["label"], hello["label"])
+
+        poll = self._post_proto(
+            "/aiserver.v1.GrokBotService/PollGrokBotUserComputerRequests",
+            {
+                "machineId": machine_id,
+                "credential": backend.LOCAL_EXEC_CREDENTIAL,
+                "limit": 20,
+            },
+            _PROTO_SCHEMAS["computer_poll_req"],
+            _PROTO_SCHEMAS["computer_poll_resp"],
+        )
+        self.assertEqual(poll.get("requests", []), [])
+
+        submit = self._post_proto(
+            "/aiserver.v1.GrokBotService/SubmitGrokBotUserComputerResponses",
+            {
+                "machineId": machine_id,
+                "credential": backend.LOCAL_EXEC_CREDENTIAL,
+                "frames": [],
+            },
+            _PROTO_SCHEMAS["computer_submit_req"],
+            _PROTO_SCHEMAS["computer_submit_resp"],
+        )
+        self.assertEqual(submit.get("acceptedCount", 0), 0)
+
+        cancelled = self._post_proto(
+            "/aiserver.v1.GrokBotService/CancelGrokBotUserComputerRequest",
+            {"machineId": machine_id, "requestId": "missing"},
+            _PROTO_SCHEMAS["computer_cancel_req"],
+            _PROTO_SCHEMAS["computer_cancel_resp"],
+        )
+        self.assertEqual(cancelled, {})
+
+    def test_stale_computer_watch_cannot_remove_successor_presence(self):
+        machine_id = "same-machine-watch"
+        old_presence = backend._register_user_computer_presence(
+            machine_id,
+            {"label": "Old watch"},
+        )
+        new_presence = backend._register_user_computer_presence(
+            machine_id,
+            {"label": "New watch"},
+        )
+
+        self.assertIs(backend.USER_COMPUTER_PRESENCE[machine_id], new_presence)
+        self.assertFalse(backend._remove_user_computer_presence(machine_id, old_presence))
+        self.assertIs(backend.USER_COMPUTER_PRESENCE[machine_id], new_presence)
+        self.assertEqual(
+            backend.USER_COMPUTER_PRESENCE[machine_id]["hello"]["label"],
+            "New watch",
+        )
+        self.assertTrue(backend._remove_user_computer_presence(machine_id, new_presence))
+        self.assertNotIn(machine_id, backend.USER_COMPUTER_PRESENCE)
+
+    def test_sand_access_status_uses_native_entitlement_fields(self):
+        response = self._post_proto(
+            "/aiserver.v1.DashboardService/GetSandAccessStatus",
+            {},
+            {},
+            _PROTO_SCHEMAS["access_resp"],
+        )
+
+        self.assertEqual(response["state"], 1)
+        self.assertEqual(response["purchaseChannel"], 3)
+        self.assertEqual(response["blockReason"], 1)
+        self.assertTrue(response["canSkipOnboarding"])
+        self.assertTrue(response["proAndSuperGrokPlansGrantAccess"])
+
     def test_gateway_create_agent_returns_gui_agent_record(self):
         response = self._post(
             "/api/createAgent",
@@ -326,7 +684,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(response["agent"]["name"], "GUI Created Bot")
         self.assertEqual(response["agent"]["description"], "created through the 0.30 local gateway")
         self.assertEqual(response["agent"]["origin"], "user")
-        self.assertEqual(response["agent"]["harness"], "box")
+        self.assert_gateway_agent_summary_036(response["agent"])
 
         replay = self._post(
             "/api/createAgent",
@@ -339,6 +697,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
 
         listed = self._post("/api/listAgents", {})
         self.assertEqual([agent["id"] for agent in listed], [response["agent"]["id"]])
+        self.assert_gateway_agent_summary_036(listed[0])
 
     def test_gateway_create_agent_defaults_to_user_origin(self):
         response = self._post(
@@ -351,7 +710,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         )
 
         self.assertEqual(response["agent"]["origin"], "user")
-        self.assertEqual(response["agent"]["harness"], "box")
+        self.assert_gateway_agent_summary_036(response["agent"])
 
     def test_gateway_channel_view_endpoints_return_valid_empty_channels_view(self):
         agent = self._post(
@@ -401,7 +760,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertTrue(group["isGroup"])
         self.assertEqual(group["memberIds"], [first["id"], second["id"]])
         self.assertEqual(group["origin"], "user")
-        self.assertEqual(group["harness"], "box")
+        self.assert_gateway_agent_summary_036(group)
 
         replay = self._post(
             "/api/createGroup",
@@ -604,6 +963,7 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             )
             self.assertTrue(all("clientNonce" not in entry for entry in replies))
             self.assertTrue(all("groupPromptNonce" not in entry for entry in replies))
+            self.assertEqual({entry["replyTo"] for entry in replies}, {tail["entries"][0]["id"]})
 
             acceptance = self._post(
                 "/api/promptAcceptanceStatus",
@@ -669,10 +1029,17 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             self.assertEqual(tail["entries"][2]["fromAgent"]["id"], second["id"])
             self.assertTrue(all("clientNonce" not in entry for entry in tail["entries"][1:]))
             self.assertTrue(all("groupPromptNonce" not in entry for entry in tail["entries"][1:]))
-            acceptance = self._post(
-                "/api/promptAcceptanceStatus",
-                {"agentId": group["id"], "clientNonce": nonce},
-            )
+            self.assertEqual({entry["replyTo"] for entry in tail["entries"][1:]}, {tail["entries"][0]["id"]})
+            acceptance = {"record": {}}
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                acceptance = self._post(
+                    "/api/promptAcceptanceStatus",
+                    {"agentId": group["id"], "clientNonce": nonce},
+                )
+                if acceptance.get("record", {}).get("completedAtMs"):
+                    break
+                time.sleep(0.05)
             self.assertEqual(acceptance["record"]["status"], "failed")
             self.assertEqual(acceptance["record"]["failedMemberIds"], [first["id"]])
             self.assertEqual(
@@ -757,6 +1124,133 @@ class LocalGatewayChatContractTests(unittest.TestCase):
             self.assertTrue(all("clientNonce" not in reply for reply in tail["entries"][1:]))
         finally:
             backend.call_model = original_call_model
+
+    def test_group_reply_batches_expose_distinct_reply_to_ids(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Batch First", "clientNonce": "batch-first"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Batch Second", "clientNonce": "batch-second"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Batch Channel", "memberAgentIds": [first["id"], second["id"]]},
+        )["agent"]
+        original_call_model = backend.call_model
+        backend.call_model = lambda prompt: f"reply-{prompt.splitlines()[-1]}"
+        try:
+            self._post(
+                "/api/sendPrompt",
+                {"agentId": group["id"], "prompt": "first prompt", "clientNonce": "batch-prompt-1"},
+            )
+            self._post(
+                "/api/sendPrompt",
+                {"agentId": group["id"], "prompt": "second prompt", "clientNonce": "batch-prompt-2"},
+            )
+            deadline = time.time() + 3
+            tail = {"entries": []}
+            while time.time() < deadline:
+                tail = self._post("/api/getAgentTranscriptTail", {"id": group["id"], "limit": 10})
+                if len(tail["entries"]) >= 6:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(len(tail["entries"]), 6)
+            users = [entry for entry in tail["entries"] if entry["role"] == "user"]
+            replies = [entry for entry in tail["entries"] if entry["role"] == "assistant"]
+            self.assertEqual([entry["content"] for entry in users], ["first prompt", "second prompt"])
+            self.assertEqual(len(replies), 4)
+            first_user, second_user = users
+            first_replies = [entry for entry in replies if entry["replyTo"] == first_user["id"]]
+            second_replies = [entry for entry in replies if entry["replyTo"] == second_user["id"]]
+            self.assertEqual(len(first_replies), 2)
+            self.assertEqual(len(second_replies), 2)
+            self.assertNotEqual(first_user["id"], second_user["id"])
+        finally:
+            backend.call_model = original_call_model
+
+    def test_legacy_channel_name_resolves_to_unique_group_uuid(self):
+        member = self._post(
+            "/api/createAgent",
+            {"name": "Alias Member", "clientNonce": "alias-member"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "555", "memberAgentIds": [member["id"]]},
+        )["agent"]
+
+        self.assertEqual(_resolve_agent_id("555"), group["id"])
+        self.assertEqual(_first_agent_id({"id": "555"}), group["id"])
+
+        backend.ensure_agent("555")
+        listed = self._post("/api/listAgents", {})
+        self.assertTrue(any(agent["id"] == group["id"] and agent["isGroup"] for agent in listed))
+        self.assertFalse(any(agent["id"] == "555" for agent in listed))
+
+        backend.append_entry(
+            group["id"],
+            "message",
+            {"kind": "message", "role": "assistant", "content": "alias-visible"},
+        )
+        tail = self._post("/api/getAgentTranscriptTail", {"id": "555", "limit": 8})
+        self.assertEqual([entry["content"] for entry in tail["entries"]], ["alias-visible"])
+
+    def test_native_roster_preserves_group_identity_fields(self):
+        member = self._post(
+            "/api/createAgent",
+            {"name": "Native Member", "clientNonce": "native-group-member"},
+        )["agent"]
+        group = self._post(
+            "/api/createGroup",
+            {"name": "Native Channel", "memberAgentIds": [member["id"]]},
+        )["agent"]
+
+        listed = self._post_proto(
+            "/aiserver.v1.GrokBotService/ListGrokBotAgents",
+            {},
+            {},
+            _PROTO_SCHEMAS["list_agents_resp"],
+        )
+        native_group = next(agent for agent in listed["agents"] if agent["id"] == group["id"])
+        self.assertEqual(native_group["kind"], 2)
+        self.assertEqual(native_group["memberAgentIds"], [member["id"]])
+
+    def test_native_room_create_and_member_update_round_trip(self):
+        first = self._post(
+            "/api/createAgent",
+            {"name": "Native Room Member A", "clientNonce": "native-room-member-a"},
+        )["agent"]
+        second = self._post(
+            "/api/createAgent",
+            {"name": "Native Room Member B", "clientNonce": "native-room-member-b"},
+        )["agent"]
+        room_id = "native-room-contract"
+
+        created = self._post_proto(
+            "/aiserver.v1.GrokBotService/CreateGrokBotRoom",
+            {
+                "agentId": room_id,
+                "name": "Native Room",
+                "description": "created through the native room contract",
+                "memberAgentIds": [first["id"], second["id"]],
+            },
+            _PROTO_SCHEMAS["room_create_req"],
+            _PROTO_SCHEMAS["room_resp"],
+        )
+        self.assertEqual(created["agent"]["id"], room_id)
+        self.assertEqual(created["agent"]["kind"], 2)
+        self.assertEqual(created["agent"]["memberAgentIds"], [first["id"], second["id"]])
+
+        updated = self._post_proto(
+            "/aiserver.v1.GrokBotService/SetGrokBotRoomMembers",
+            {"agentId": room_id, "memberAgentIds": [second["id"]]},
+            _PROTO_SCHEMAS["room_set_members_req"],
+            _PROTO_SCHEMAS["room_resp"],
+        )
+        self.assertEqual(updated["agent"]["id"], room_id)
+        self.assertEqual(updated["agent"]["kind"], 2)
+        self.assertEqual(updated["agent"]["memberAgentIds"], [second["id"]])
 
     def test_gateway_update_agent_applies_profile_and_persists(self):
         created = self._post(
@@ -901,7 +1395,8 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         listed = self._post("/api/listAgents", {})
         listed_agent = next(agent for agent in listed if agent["id"] == agent_id)
         self.assertEqual(listed_agent["avatarVersion"], updated["version"])
-        self.assertNotIn("avatarDataUrl", listed_agent)
+        self.assertIn("avatarDataUrl", listed_agent)
+        self.assertIsNone(listed_agent["avatarDataUrl"])
 
     def test_gateway_avatar_rejects_non_png_payload(self):
         with self.assertRaises(urllib.error.HTTPError) as raised:
@@ -915,13 +1410,46 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(error["code"], "INVALID_AVATAR")
         self.assertEqual(AGENT_INDEX, {})
 
+    def test_call_model_supports_explicit_ollama_backend(self):
+        captured = {}
+        original_config = backend.bc.config
+        original_post = backend.httpx.post
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"message": {"content": "local default reply"}}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs["json"]
+            return FakeResponse()
+
+        backend.bc.config = lambda: {
+            "model_backend": "ollama",
+            "ollama_url": "http://127.0.0.1:11434",
+        }
+        backend.httpx.post = fake_post
+        backend.call_model = self.original_call_model
+        try:
+            self.assertEqual(backend.call_model("hello"), "local default reply")
+        finally:
+            backend.call_model = self.original_call_model
+            backend.bc.config = original_config
+            backend.httpx.post = original_post
+
+        self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(captured["json"]["model"], "lfm2.5:8b-a1b")
+
     def test_native_local_send_acceptance_and_transcript_echo(self):
         self.assertEqual(self._get("/health"), {"ok": True})
 
         agent_id = "agent-contract-test"
         roster = self._post("/api/listAgents", {})
         self.assertTrue(roster)
-        self.assertEqual(roster[0]["harness"], "box")
+        self.assert_gateway_agent_summary_036(roster[0])
 
         nonce = "nonce-contract-test"
         self.assertEqual(
@@ -993,6 +1521,14 @@ class LocalGatewayChatContractTests(unittest.TestCase):
         self.assertEqual(opened, tail)
         self.assertEqual(opened["entries"][0]["role"], "user")
         self.assertEqual(opened["entries"][1]["role"], "assistant")
+
+    def test_gateway_transcript_page_omits_terminal_null_cursor(self):
+        tail = self._post(
+            "/api/getAgentTranscriptTail",
+            {"id": "agent-terminal-cursor-contract-test", "limit": 10},
+        )
+
+        self.assertEqual(tail, {"entries": []})
 
     def test_concurrent_duplicate_nonce_creates_one_user_entry(self):
         agent_id = "agent-concurrent-contract-test"

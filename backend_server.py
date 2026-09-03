@@ -1,13 +1,14 @@
-"""Replacement backend v2: native Grok Bot chat with YOUR models.
+"""Replacement backend v2: native Grok Bot chat with an explicit model route.
 
-Flow: App SendGrokBotUserMessage → we run the agent loop (your gateway/Ollama)
+Flow: App SendGrokBotUserMessage → we run the agent loop (Codex Responses/Ollama)
 → we append transcript entries (send_message / assistant_text) → the app's
 WatchGrokBotTranscripts stream delivers them → the app UI renders natively.
 
-Zero Grok inference. Zero quota.
+No Grok inference. Provider usage is determined by the selected explicit route.
 """
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge_common as bc  # noqa: E402
+import model_runtime  # noqa: E402
 
 import httpx  # noqa: E402
 
@@ -64,10 +66,11 @@ LOCAL_EXEC_CREDENTIAL = "bridge-local-exec-credential"
 LOCAL_EXEC_TOKEN = "bridge-local-exec-token"
 LOCAL_EXEC_BASE_URL = "http://127.0.0.1:9000"
 LOCAL_EXEC_PROVIDERS = {}
+USER_COMPUTER_PRESENCE = {}
 RUNTIME_CAPABILITIES = {
     # These flags describe the local replacement backend, not the remote Grok
-    # service. Temporal creation remains disabled because execution is local
-    # box/Ollama only.
+    # service. Temporal creation remains disabled because this bridge owns the
+    # durable local identity and transcript lifecycle itself.
     "durableIdentityEnabled": True,
     "durableIdentityWritesEnabled": True,
     "temporalCreationEnabled": False,
@@ -78,6 +81,180 @@ SAND_MACHINE = {
     "label": bc.config().get("label", "Local Grok Bridge"),
     "localToolPermission": "ask",
 }
+HOST_SETTINGS_LOCK = threading.Lock()
+HOST_SETTINGS = {
+    "autoReviewInstructions": {
+        "allowInstructions": [],
+        "blockInstructions": [],
+        "isEnabled": False,
+    },
+    "hasSeenOnboarding": True,
+    "localToolPermission": "ask",
+    "mcpBoxServers": [],
+    "mcpCustomInstructions": {},
+    "mcpCustomInstructionsByServerId": {},
+    "mcpDisabledToolsByServerId": {},
+    "mcpHeldAccountScopes": [],
+    "notifications": {
+        "allowedApps": [],
+        "isEnabled": False,
+        "maxPerWindow": 0,
+        "minIntervalMs": 0,
+        "windowMs": 0,
+    },
+    "pinnedAgentIds": [],
+    "sidebarSections": [],
+    "webauthnProxyEnabled": False,
+}
+
+
+def _model_runtime_snapshot() -> dict:
+    """Return model routing intent without returning credentials."""
+    try:
+        return {"ok": True, **model_runtime.model_runtime_summary(bc.config())}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+
+
+def _host_capabilities() -> list[str]:
+    snapshot = _model_runtime_snapshot()
+    backend = snapshot.get("backend") if snapshot.get("ok") else "unconfigured"
+    return ["transcript", "send", f"model-{backend}"]
+
+
+def _host_settings_snapshot() -> dict:
+    with HOST_SETTINGS_LOCK:
+        return copy.deepcopy(HOST_SETTINGS)
+
+
+def _update_host_settings(update: dict) -> dict:
+    """Apply the 0.36 settings update while preserving a valid full reply."""
+    if not isinstance(update, dict):
+        return _host_settings_snapshot()
+
+    with HOST_SETTINGS_LOCK:
+        instructions = update.get("autoReviewInstructions")
+        if isinstance(instructions, dict):
+            HOST_SETTINGS["autoReviewInstructions"] = {
+                "allowInstructions": [
+                    value for value in instructions.get("allowInstructions", []) if isinstance(value, str)
+                ],
+                "blockInstructions": [
+                    value for value in instructions.get("blockInstructions", []) if isinstance(value, str)
+                ],
+                "isEnabled": bool(instructions.get("isEnabled", False)),
+            }
+
+        notifications = update.get("notifications")
+        if isinstance(notifications, dict):
+            merged = dict(HOST_SETTINGS["notifications"])
+            if isinstance(notifications.get("allowedApps"), list):
+                merged["allowedApps"] = [
+                    value for value in notifications["allowedApps"] if isinstance(value, str)
+                ]
+            if isinstance(notifications.get("isEnabled"), bool):
+                merged["isEnabled"] = notifications["isEnabled"]
+            for key in ("maxPerWindow", "minIntervalMs", "windowMs"):
+                value = notifications.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    merged[key] = value
+            HOST_SETTINGS["notifications"] = merged
+
+        list_fields = {
+            "mcpBoxServers",
+            "mcpHeldAccountScopes",
+            "pinnedAgentIds",
+        }
+        for key in list_fields:
+            value = update.get(key)
+            if isinstance(value, list):
+                HOST_SETTINGS[key] = [item for item in value if isinstance(item, str)]
+
+        map_fields = {
+            "mcpCustomInstructions",
+            "mcpCustomInstructionsByServerId",
+        }
+        for key in map_fields:
+            value = update.get(key)
+            if isinstance(value, dict):
+                HOST_SETTINGS[key] = {
+                    str(item_key): item_value
+                    for item_key, item_value in value.items()
+                    if isinstance(item_value, str)
+                }
+
+        disabled_tools = update.get("mcpDisabledToolsByServerId")
+        if isinstance(disabled_tools, dict):
+            HOST_SETTINGS["mcpDisabledToolsByServerId"] = {
+                str(server_id): [tool for tool in tools if isinstance(tool, str)]
+                for server_id, tools in disabled_tools.items()
+                if isinstance(tools, list)
+            }
+
+        sections = update.get("sidebarSections")
+        if isinstance(sections, list):
+            normalized_sections = []
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                section_id = _text_field(section.get("id"))
+                name = _text_field(section.get("name"))
+                agent_ids = section.get("agentIds")
+                if not section_id or not name or not isinstance(agent_ids, list):
+                    continue
+                normalized_sections.append(
+                    {
+                        "agentIds": [item for item in agent_ids if isinstance(item, str)],
+                        "id": section_id,
+                        "isCollapsed": bool(section.get("isCollapsed", False)),
+                        "name": name,
+                    }
+                )
+            HOST_SETTINGS["sidebarSections"] = normalized_sections
+
+        for key in ("hasSeenOnboarding", "messagesEnabled"):
+            if key in update and (update[key] is None or isinstance(update[key], bool)):
+                HOST_SETTINGS[key] = update[key]
+
+        permission = update.get("localToolPermission")
+        if permission in {"always", "ask", "never"}:
+            HOST_SETTINGS["localToolPermission"] = permission
+
+        webauthn = update.get("webauthnProxyEnabled")
+        if isinstance(webauthn, bool):
+            HOST_SETTINGS["webauthnProxyEnabled"] = webauthn
+
+        for key in ("userTimeZone", "userTimeZoneOverride"):
+            value = update.get(key)
+            if isinstance(value, str):
+                HOST_SETTINGS[key] = value
+
+        account_scope = update.get("mcpCustomInstructionsAccountScope", ...)
+        if account_scope is None:
+            HOST_SETTINGS.pop("mcpCustomInstructionsAccountScope", None)
+        elif isinstance(account_scope, str):
+            HOST_SETTINGS["mcpCustomInstructionsAccountScope"] = account_scope
+
+        selected_team = update.get("selectedTeam", ...)
+        if selected_team is None:
+            HOST_SETTINGS.pop("selectedTeamId", None)
+        elif isinstance(selected_team, dict):
+            team_id = selected_team.get("teamId")
+            if isinstance(team_id, (int, float)) and not isinstance(team_id, bool):
+                HOST_SETTINGS["selectedTeamId"] = team_id
+
+        for key in ("agentDefaultModel", "computerUseModel"):
+            value = update.get(key, ...)
+            if value is None:
+                HOST_SETTINGS.pop(key, None)
+            elif isinstance(value, dict):
+                if key != "agentDefaultModel" or value.get("maxMode") is True:
+                    HOST_SETTINGS[key] = copy.deepcopy(value)
+
+        return copy.deepcopy(HOST_SETTINGS)
 
 
 def log(msg: str) -> None:
@@ -87,7 +264,34 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def _default_agent_meta(agent_id: str, *, name: str = "Bridge Bot", description: str = "Local Ollama-backed Grok Bot") -> dict:
+def _register_user_computer_presence(machine_id: str, hello: dict) -> dict:
+    presence = {
+        "machineId": str(machine_id),
+        "hello": dict(hello) if isinstance(hello, dict) else {},
+        "lastSeenAtMs": int(time.time() * 1000),
+    }
+    with LOCK:
+        USER_COMPUTER_PRESENCE[str(machine_id)] = presence
+    return presence
+
+
+def _touch_user_computer_presence(machine_id: str, presence: dict) -> bool:
+    with LOCK:
+        if USER_COMPUTER_PRESENCE.get(str(machine_id)) is not presence:
+            return False
+        presence["lastSeenAtMs"] = int(time.time() * 1000)
+        return True
+
+
+def _remove_user_computer_presence(machine_id: str, presence: dict) -> bool:
+    with LOCK:
+        if USER_COMPUTER_PRESENCE.get(str(machine_id)) is not presence:
+            return False
+        USER_COMPUTER_PRESENCE.pop(str(machine_id), None)
+        return True
+
+
+def _default_agent_meta(agent_id: str, *, name: str = "Bridge Bot", description: str = "Explicit model-backed Grok Bot") -> dict:
     now_ms = int(time.time() * 1000)
     return {
         "name": name,
@@ -377,7 +581,7 @@ def _entry_body_obj(entry: dict) -> dict:
 
 
 def _model_task(agent_id: str, task: str, client_nonce: str = "") -> str:
-    """Add bounded prior turns so local Ollama sees conversation context."""
+    """Add bounded prior turns so the selected model sees conversation context."""
     with TRANSCRIPT_CHANGED:
         entries = list(TRANSCRIPTS.get(agent_id, {}).get("entries", []))
     turns = []
@@ -418,6 +622,15 @@ def _group_member_agent_ref(member_id: str) -> dict[str, str]:
         meta = AGENT_INDEX.get(member_id)
         name = _text_field(meta.get("name"), member_id) if isinstance(meta, dict) else member_id
     return {"id": member_id, "name": name}
+
+
+def _prompt_echo_entry_id(agent_id: str, client_nonce: str) -> str:
+    """Return the durable user-echo id that owns one accepted prompt."""
+    if not client_nonce:
+        return ""
+    with TRANSCRIPT_CHANGED:
+        record = PROMPT_ACCEPTANCE.get((agent_id, client_nonce), {})
+        return _text_field(record.get("echoEntryId"))
 
 
 def _group_completed_members(group_id: str, client_nonce: str) -> dict[str, dict]:
@@ -462,6 +675,7 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
         if result.get("status") == "accepted" and result.get("entryId")
     ]
     failed_member_ids = [member_id for member_id, result in completed.items() if result.get("status") == "failed"]
+    reply_to = _prompt_echo_entry_id(group_id, client_nonce)
 
     for member_id in member_ids:
         if member_id in completed:
@@ -481,6 +695,7 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
                     "memberAgentId": member_id,
                     "authorId": member_id,
                     "fromAgent": member_agent,
+                    **({"replyTo": reply_to} if reply_to else {}),
                     "timestampMs": int(time.time() * 1000),
                 },
             )
@@ -497,7 +712,7 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
                     {
                         "kind": "message",
                         "role": "assistant",
-                        "content": f"Local model execution failed for member {member_id}: {detail}",
+                        "content": f"Model execution failed for member {member_id}: {detail}",
                         "isStreaming": False,
                         "isError": True,
                         "errorCode": "LOCAL_MODEL_ERROR",
@@ -505,6 +720,7 @@ def _group_agent_loop(group_id: str, task: str, client_nonce: str = "") -> None:
                         "memberAgentId": member_id,
                         "authorId": member_id,
                         "fromAgent": member_agent,
+                        **({"replyTo": reply_to} if reply_to else {}),
                         "timestampMs": int(time.time() * 1000),
                     },
                 )
@@ -572,38 +788,30 @@ def resume_pending_prompts() -> int:
 
 
 def call_model(task: str) -> str:
-    """Run the configured local Ollama model without any remote fallback."""
+    """Run exactly one configured model route without cross-provider fallback."""
     cfg = bc.config()
-    ollama_url = cfg.get("ollama_url", "http://127.0.0.1:11434").rstrip("/")
-    ollama_model = cfg.get("ollama_model", "gemma4-26b-qat-uncensored:q4km")
+    binding = model_runtime.resolve_model_binding(cfg)
     try:
-        r = httpx.post(
-            f"{ollama_url}/api/chat",
-            json={
-                "model": ollama_model,
-                "messages": [{"role": "user", "content": task}],
-                "stream": False,
-            },
-            timeout=300,
-            trust_env=False,
-        )
-        r.raise_for_status()
-        content = (r.json().get("message") or {}).get("content", "")
-        if content:
-            log(f"[model] ollama {ollama_model} replied ({len(content)} chars)")
-            return content
-        detail = "response did not contain message.content"
+        content = model_runtime.execute_model(binding, task, post=httpx.post)
     except Exception as exc:
-        detail = f"{type(exc).__name__}: {str(exc)[:160]}"
-    message = f"local Ollama unavailable at {ollama_url} using {ollama_model}: {detail}"
-    log(f"[model] local-only failure; gateway disabled: {message}")
-    raise RuntimeError(message)
+        detail = f"{type(exc).__name__}: {str(exc)[:220]}"
+        log(
+            f"[model] explicit route failure backend={binding.backend} "
+            f"provider={binding.provider_key} model={binding.model}: {detail}"
+        )
+        raise RuntimeError(detail) from exc
+    log(
+        f"[model] backend={binding.backend} provider={binding.provider_key} "
+        f"model={binding.model} replied ({len(content)} chars)"
+    )
+    return content
 
 
 def agent_loop(agent_id: str, task: str, client_nonce: str = "") -> None:
     """Run the local model and append a renderer-valid assistant message."""
     try:
         reply = call_model(_model_task(agent_id, task, client_nonce))
+        reply_to = _prompt_echo_entry_id(agent_id, client_nonce)
         _commit_prompt_result(
             agent_id,
             client_nonce,
@@ -612,6 +820,7 @@ def agent_loop(agent_id: str, task: str, client_nonce: str = "") -> None:
                 "role": "assistant",
                 "content": reply,
                 "isStreaming": False,
+                **({"replyTo": reply_to} if reply_to else {}),
                 "timestampMs": int(time.time() * 1000),
             },
         )
@@ -620,16 +829,18 @@ def agent_loop(agent_id: str, task: str, client_nonce: str = "") -> None:
         detail = f"{type(e).__name__}: {str(e)[:240]}"
         log(f"[loop] error: {detail[:280]}")
         try:
+            reply_to = _prompt_echo_entry_id(agent_id, client_nonce)
             _commit_prompt_result(
                 agent_id,
                 client_nonce,
                 {
                     "kind": "message",
                     "role": "assistant",
-                    "content": f"Local model execution failed: {detail}",
+                    "content": f"Model execution failed: {detail}",
                     "isStreaming": False,
                     "isError": True,
                     "errorCode": "LOCAL_MODEL_ERROR",
+                    **({"replyTo": reply_to} if reply_to else {}),
                     "timestampMs": int(time.time() * 1000),
                 },
                 failed=True,
@@ -680,6 +891,53 @@ def handle_oauth_token(body: dict) -> dict:
     }
 
 
+def handle_dev_session_token(query: dict) -> dict:
+    """Mint the native app's initial local session without contacting a provider.
+
+    Grok Bot 0.30's SAND_DEV_LOGIN path expects camelCase fields from this
+    endpoint. Keep the identity fixed to the local bridge and carry the
+    requested email through the refresh token so a later /oauth/token refresh
+    preserves the same account identity.
+    """
+    def first(name: str, default: str = "") -> str:
+        values = query.get(name, []) if isinstance(query, dict) else []
+        value = values[0] if values else default
+        return str(value or default).strip()
+
+    email = first("email", "bridge@local") or "bridge@local"
+    plan = first("plan", "ultra") or "ultra"
+    trial = first("trial", "")
+    now = int(time.time())
+    sub = "grok|bridge-user"
+    access = mint_jwt(
+        {
+            "sub": sub,
+            "email": email,
+            "plan": plan,
+            "trial": trial.lower() == "true",
+            "exp": now + 3600 * 24,
+            "iss": "grok-bridge",
+        }
+    )
+    refresh = mint_jwt(
+        {
+            "sub": sub,
+            "email": email,
+            "plan": plan,
+            "exp": now + 3600 * 24 * 30,
+            "iss": "grok-bridge",
+            "token_kind": "refresh",
+        }
+    )
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresIn": 3600 * 24,
+        "email": email,
+        "plan": plan,
+    }
+
+
 # ---- identity (M2, unchanged) ----
 RESPONSES = {
     "/aiserver.v1.DashboardService/GetMe": {
@@ -717,14 +975,23 @@ RESPONSES = {
     },
     "/aiserver.v1.GrokBotService/GetSandBoxRunState": {"state": "SAND_BOX_RUN_STATE_RUNNING", "imageUpdateAvailable": False},
     "/aiserver.v1.GrokBotService/ListSandBoxes": {"boxes": [{"running": True}]},
-    "/aiserver.v1.DashboardService/GetSandAccessStatus": {"hasAccess": True},
+    # 0.36 decodes this response by its protobuf fields. ``hasAccess`` is a
+    # legacy JSON alias and is not part of GetSandAccessStatusResponse, so it
+    # encoded to an empty body and made entitlement initialization fail.
+    "/aiserver.v1.DashboardService/GetSandAccessStatus": {
+        "state": "GRANTED",
+        "purchaseChannel": "MANAGE_ON_WEB",
+        "blockReason": "NONE",
+        "canSkipOnboarding": True,
+        "proAndSuperGrokPlansGrantAccess": True,
+    },
     "/aiserver.v1.DashboardService/GetSandTrialClaimStatus": {"status": 1},
     "/aiserver.v1.DashboardService/GetHardLimit": {"noUsageBasedAllowed": True},
     "/aiserver.v1.GrokBotService/ListGrokBotAgents": {"agents": []},  # placeholder, filled dynamically
 }
 
 
-def ensure_agent(agent_id: str, *, name: str = "Bridge Bot", description: str = "Local Ollama-backed Grok Bot") -> dict:
+def ensure_agent(agent_id: str, *, name: str = "Bridge Bot", description: str = "Explicit model-backed Grok Bot") -> dict:
     """Materialize an agent lazily so an app-created or restored id always has a store."""
     with TRANSCRIPT_CHANGED:
         now_ms = int(time.time() * 1000)
@@ -811,6 +1078,7 @@ def _create_gateway_group(req: dict) -> dict:
         raise GatewayContractError("INVALID_GROUP_NAME", "name must not be empty")
     description = _text_field(req.get("description"))
     member_ids = _normalize_group_member_ids(req.get("memberAgentIds"))
+    requested_id = _text_field(req.get("agentId"))
     fingerprint = hashlib.sha256(
         json.dumps(
             {"name": name, "memberAgentIds": member_ids},
@@ -829,7 +1097,14 @@ def _create_gateway_group(req: dict) -> dict:
             else:
                 _validate_group_member_ids_locked(member_ids)
 
-                group_id = str(uuid.uuid4())
+                group_id = requested_id or str(uuid.uuid4())
+                occupied = AGENT_INDEX.get(group_id)
+                if occupied is not None:
+                    raise GatewayContractError(
+                        "AGENT_ID_CONFLICT",
+                        "agent id is already in use",
+                        agentId=group_id,
+                    )
                 meta = _default_agent_meta(group_id, name=name, description=description)
                 meta.update(
                     {
@@ -1119,7 +1394,7 @@ def _create_gateway_agent(req: dict) -> dict:
             agent_id = str(uuid.uuid4())
 
         name = _text_field(req.get("name"), "Bridge Bot")
-        description = _text_field(req.get("description"), "Local Ollama-backed Grok Bot")
+        description = _text_field(req.get("description"), "Explicit model-backed Grok Bot")
         ensure_agent(agent_id, name=name, description=description)
         changed = False
         with TRANSCRIPT_CHANGED:
@@ -1219,15 +1494,45 @@ def _gateway_agent_avatar(agent_id: str) -> dict:
 
 
 def _first_agent_id(fields) -> str:
-    """Read a restored agent id from either JSON fields or parse_qs output."""
+    """Read and canonicalize a restored agent id from JSON or query fields."""
     for key in ("id", "agentId", "agent_id"):
         value = fields.get(key, "") if hasattr(fields, "get") else ""
         if isinstance(value, (list, tuple)):
             value = value[0] if value else ""
         value = str(value or "").strip()
         if value:
-            return value
+            return _resolve_agent_id(value)
     return ""
+
+
+def _resolve_agent_id(value: str) -> str:
+    """Resolve legacy channel-name selections to one durable group UUID.
+
+    Older desktop selections can persist a channel name such as ``555``
+    instead of the UUID returned by the roster API. If that name identifies a
+    unique group, prefer the group over a lazily materialized plain Bot with
+    the same string id. Exact UUID/id matches remain unchanged unless a
+    group-name match is present, which is the compatibility case this guards.
+    """
+    candidate = _text_field(value)
+    if not candidate:
+        return ""
+    with TRANSCRIPT_CHANGED:
+        group_matches = [
+            agent_id
+            for agent_id, meta in AGENT_INDEX.items()
+            if meta.get("isGroup")
+            and candidate.casefold()
+            in {
+                _text_field(meta.get("name")).casefold(),
+                _text_field(meta.get("title")).casefold(),
+            }
+        ]
+        if len(group_matches) == 1:
+            exact = AGENT_INDEX.get(candidate)
+            if exact is None or not exact.get("isGroup"):
+                return group_matches[0]
+        return candidate
 
 
 def _connect_frame(obj: dict) -> bytes:
@@ -1476,6 +1781,55 @@ _ENUM_AGENT_HARNESS = {
     "BOX": 1,
     "TEMPORAL": 2,
 }
+_ENUM_AGENT_KIND = {
+    "GROK_BOT_AGENT_KIND_UNSPECIFIED": 0,
+    "GROK_BOT_AGENT_KIND_AGENT": 1,
+    "GROK_BOT_AGENT_KIND_ROOM": 2,
+    "AGENT": 1,
+    "ROOM": 2,
+}
+_ENUM_ACCESS_STATE = {
+    "SAND_ACCESS_STATE_UNSPECIFIED": 0,
+    "UNSPECIFIED": 0,
+    "SAND_ACCESS_STATE_GRANTED": 1,
+    "GRANTED": 1,
+    "SAND_ACCESS_STATE_UNAVAILABLE": 2,
+    "UNAVAILABLE": 2,
+    "SAND_ACCESS_STATE_PAYMENT_REQUIRED": 3,
+    "PAYMENT_REQUIRED": 3,
+}
+_ENUM_PURCHASE_CHANNEL = {
+    "SAND_PURCHASE_CHANNEL_UNSPECIFIED": 0,
+    "UNSPECIFIED": 0,
+    "SAND_PURCHASE_CHANNEL_IN_APP": 1,
+    "IN_APP": 1,
+    "SAND_PURCHASE_CHANNEL_MANAGE_IN_CURSOR": 2,
+    "MANAGE_IN_CURSOR": 2,
+    "SAND_PURCHASE_CHANNEL_MANAGE_ON_WEB": 3,
+    "MANAGE_ON_WEB": 3,
+}
+_ENUM_ACCESS_BLOCK_REASON = {
+    "SAND_ACCESS_BLOCK_REASON_UNSPECIFIED": 0,
+    "UNSPECIFIED": 0,
+    "SAND_ACCESS_BLOCK_REASON_NONE": 1,
+    "NONE": 1,
+    "SAND_ACCESS_BLOCK_REASON_TEAM_PRIVACY_MODE": 2,
+    "TEAM_PRIVACY_MODE": 2,
+    "SAND_ACCESS_BLOCK_REASON_TEAM_SETUP_REQUIRED": 3,
+    "TEAM_SETUP_REQUIRED": 3,
+    "SAND_ACCESS_BLOCK_REASON_TEAM_ACCESS_REQUIRED": 4,
+    "TEAM_ACCESS_REQUIRED": 4,
+    "SAND_ACCESS_BLOCK_REASON_NOT_OFFERED": 5,
+    "NOT_OFFERED": 5,
+    "SAND_ACCESS_BLOCK_REASON_FREE_TRIAL_AVAILABLE": 6,
+    "FREE_TRIAL_AVAILABLE": 6,
+    "SAND_ACCESS_BLOCK_REASON_PAYWALL_INDIVIDUAL": 7,
+    "PAYWALL_INDIVIDUAL": 7,
+    "SAND_ACCESS_BLOCK_REASON_PAYWALL_TEAM_MEMBER": 8,
+    "PAYWALL_TEAM_MEMBER": 8,
+    "SAND_ACCESS_BLOCK_REASON_PAYWALL_TEAM_ADMIN": 9,
+    "PAYWALL_TEAM_ADMIN": 9,
+}
 
 _PROTO_TRANSCRIPT_ENTRY = {
     1: _proto_schema_field("seq", "int"),
@@ -1520,6 +1874,67 @@ _PROTO_COMPUTER_WATCH_EVENT = {
         emit_empty=True,
     ),
 }
+_PROTO_COMPUTER_EXEC = {
+    1: _proto_schema_field("serverMessageJson", "str"),
+    2: _proto_schema_field("approvalId", "str"),
+    3: _proto_schema_field("authorizedByStanding", "bool"),
+    4: _proto_schema_field("authorizedByApproval", "bool"),
+}
+_PROTO_COMPUTER_UPLOAD = {
+    1: _proto_schema_field("path", "str"),
+    2: _proto_schema_field("data", "bytes"),
+    3: _proto_schema_field("authorizedByStanding", "bool"),
+    4: _proto_schema_field("authorizedByApproval", "bool"),
+}
+_PROTO_COMPUTER_DOWNLOAD = {
+    1: _proto_schema_field("path", "str"),
+    2: _proto_schema_field("approvalId", "str"),
+    3: _proto_schema_field("authorizedByStanding", "bool"),
+    4: _proto_schema_field("authorizedByApproval", "bool"),
+}
+_PROTO_COMPUTER_RETIRE_APPROVAL = {1: _proto_schema_field("approvalId", "str")}
+_PROTO_COMPUTER_MESSAGES_OP = {
+    1: _proto_schema_field("opJson", "str"),
+    2: _proto_schema_field("approvalId", "str"),
+}
+_PROTO_COMPUTER_REQUEST_FRAME = {
+    1: _proto_schema_field("requestId", "str"),
+    2: _proto_schema_field("exec", "msg", schema=_PROTO_COMPUTER_EXEC),
+    3: _proto_schema_field("upload", "msg", schema=_PROTO_COMPUTER_UPLOAD),
+    4: _proto_schema_field("download", "msg", schema=_PROTO_COMPUTER_DOWNLOAD),
+    5: _proto_schema_field("retireApproval", "msg", schema=_PROTO_COMPUTER_RETIRE_APPROVAL),
+    6: _proto_schema_field("cancel", "msg", schema={}),
+    7: _proto_schema_field("messagesOp", "msg", schema=_PROTO_COMPUTER_MESSAGES_OP),
+}
+_PROTO_COMPUTER_CLIENT_MESSAGE = {1: _proto_schema_field("messageJson", "str")}
+_PROTO_COMPUTER_CONTROL_MESSAGE = {
+    1: _proto_schema_field("messageJson", "str"),
+    2: _proto_schema_field("cwdState", "str"),
+}
+_PROTO_COMPUTER_FILE = {
+    1: _proto_schema_field("data", "bytes"),
+    2: _proto_schema_field("seq", "int"),
+    3: _proto_schema_field("last", "bool"),
+}
+_PROTO_COMPUTER_RESPONSE_FRAME = {
+    1: _proto_schema_field("requestId", "str"),
+    2: _proto_schema_field("client", "msg", schema=_PROTO_COMPUTER_CLIENT_MESSAGE),
+    3: _proto_schema_field("control", "msg", schema=_PROTO_COMPUTER_CONTROL_MESSAGE),
+    4: _proto_schema_field("file", "msg", schema=_PROTO_COMPUTER_FILE),
+    5: _proto_schema_field("fileError", "msg", schema={1: _proto_schema_field("error", "str")}),
+    6: _proto_schema_field("messagesResult", "msg", schema={1: _proto_schema_field("resultJson", "str")}),
+    7: _proto_schema_field("messagesError", "msg", schema={1: _proto_schema_field("error", "str")}),
+}
+_PROTO_COMPUTER_PRESENCE = {
+    1: _proto_schema_field("machineId", "str"),
+    2: _proto_schema_field("hello", "msg", schema=_PROTO_COMPUTER_HELLO),
+    3: _proto_schema_field("lastSeenAtMs", "int"),
+}
+_PROTO_COMPUTER_QUEUED_REQUEST = {
+    1: _proto_schema_field("id", "str"),
+    2: _proto_schema_field("frame", "msg", schema=_PROTO_COMPUTER_REQUEST_FRAME),
+    3: _proto_schema_field("enqueuedAtMs", "int"),
+}
 _PROTO_AGENT = {
     1: _proto_schema_field("id", "str"),
     2: _proto_schema_field("legacyAgentId", "str"),
@@ -1538,6 +1953,14 @@ _PROTO_AGENT = {
     15: _proto_schema_field("visibility", "enum"),
     16: _proto_schema_field("teamId", "int"),
     17: _proto_schema_field("viewerIsOwner", "bool"),
+    # 0.36 native contract: these field numbers are not the gateway's
+    # ``isGroup``/``memberIds`` aliases.  Reusing 18/19 for those aliases
+    # changes the wire type and makes the native decoder fail as soon as a
+    # room is present in the roster.  Keep gateway aliases in the JSON object,
+    # but encode the native identity fields exactly as proto.cjs declares them.
+    18: _proto_schema_field("viewerSessionId", "str"),
+    19: _proto_schema_field("kind", "enum", enum=_ENUM_AGENT_KIND),
+    20: _proto_schema_field("memberAgentIds", "str", repeated=True),
 }
 _PROTO_SAND_MACHINE = {
     1: _proto_schema_field("machineId", "str"),
@@ -1618,6 +2041,34 @@ _PROTO_SCHEMAS = {
         2: _proto_schema_field("credential", "str"),
         3: _proto_schema_field("hello", "msg", schema=_PROTO_COMPUTER_HELLO),
     },
+    "computer_poll_req": {
+        1: _proto_schema_field("machineId", "str"),
+        2: _proto_schema_field("credential", "str"),
+        3: _proto_schema_field("ackIds", "str", repeated=True),
+        4: _proto_schema_field("limit", "int"),
+    },
+    "computer_poll_resp": {
+        1: _proto_schema_field("requests", "msg", repeated=True, schema=_PROTO_COMPUTER_QUEUED_REQUEST),
+    },
+    "computer_submit_req": {
+        1: _proto_schema_field("machineId", "str"),
+        2: _proto_schema_field("credential", "str"),
+        3: _proto_schema_field("frames", "msg", repeated=True, schema=_PROTO_COMPUTER_RESPONSE_FRAME),
+    },
+    "computer_submit_resp": {1: _proto_schema_field("acceptedCount", "int")},
+    "computer_list_resp": {
+        1: _proto_schema_field("computers", "msg", repeated=True, schema=_PROTO_COMPUTER_PRESENCE),
+    },
+    "computer_open_req": {
+        1: _proto_schema_field("machineId", "str"),
+        2: _proto_schema_field("frame", "msg", schema=_PROTO_COMPUTER_REQUEST_FRAME),
+        3: _proto_schema_field("idempotencyKey", "str"),
+    },
+    "computer_cancel_req": {
+        1: _proto_schema_field("machineId", "str"),
+        2: _proto_schema_field("requestId", "str"),
+    },
+    "computer_cancel_resp": {},
     "register_machine_req": {
         1: _proto_schema_field("label", "str"),
         2: _proto_schema_field("localToolPermission", "str"),
@@ -1651,6 +2102,14 @@ _PROTO_SCHEMAS = {
     "create_agent_resp": {
         1: _proto_schema_field("agent", "msg", schema=_PROTO_AGENT), 2: _proto_schema_field("harness", "enum"),
     },
+    "room_create_req": {
+        1: _proto_schema_field("agentId", "str"), 2: _proto_schema_field("name", "str"),
+        3: _proto_schema_field("description", "str"), 4: _proto_schema_field("memberAgentIds", "str", repeated=True),
+    },
+    "room_set_members_req": {
+        1: _proto_schema_field("agentId", "str"), 2: _proto_schema_field("memberAgentIds", "str", repeated=True),
+    },
+    "room_resp": {1: _proto_schema_field("agent", "msg", schema=_PROTO_AGENT)},
     "get_me_resp": {
         1: _proto_schema_field("authId", "str"), 2: _proto_schema_field("userId", "int"), 3: _proto_schema_field("email", "str"),
         4: _proto_schema_field("firstName", "str"), 5: _proto_schema_field("lastName", "str"),
@@ -1668,8 +2127,10 @@ _PROTO_SCHEMAS = {
         5: _proto_schema_field("partnerDataShare", "bool"), 6: _proto_schema_field("hasAcknowledgedGracePeriodDisclaimer", "bool"),
     },
     "access_resp": {
-        1: _proto_schema_field("state", "enum"), 2: _proto_schema_field("purchaseChannel", "enum"),
-        3: _proto_schema_field("blockReason", "enum"), 4: _proto_schema_field("purchasableTiers", "str", repeated=True),
+        1: _proto_schema_field("state", "enum", enum=_ENUM_ACCESS_STATE),
+        2: _proto_schema_field("purchaseChannel", "enum", enum=_ENUM_PURCHASE_CHANNEL),
+        3: _proto_schema_field("blockReason", "enum", enum=_ENUM_ACCESS_BLOCK_REASON),
+        4: _proto_schema_field("purchasableTiers", "str", repeated=True),
         6: _proto_schema_field("isPaidTrialPlan", "bool"), 7: _proto_schema_field("unpaidAdminNeedsPaidSeat", "bool"),
         9: _proto_schema_field("privacyDisclaimerRequired", "bool"), 10: _proto_schema_field("canSkipOnboarding", "bool"),
         11: _proto_schema_field("proAndSuperGrokPlansGrantAccess", "bool"),
@@ -1719,10 +2180,24 @@ def _request_schema_for_path(path: str):
         return _PROTO_SCHEMAS["watch_req"]
     if path.endswith("/WatchGrokBotUserComputerRequests"):
         return _PROTO_SCHEMAS["computer_watch_req"]
+    if path.endswith("/PollGrokBotUserComputerRequests"):
+        return _PROTO_SCHEMAS["computer_poll_req"]
+    if path.endswith("/SubmitGrokBotUserComputerResponses"):
+        return _PROTO_SCHEMAS["computer_submit_req"]
+    if path.endswith("/ListGrokBotUserComputers"):
+        return {}
+    if path.endswith("/OpenGrokBotUserComputerRequest"):
+        return _PROTO_SCHEMAS["computer_open_req"]
+    if path.endswith("/CancelGrokBotUserComputerRequest"):
+        return _PROTO_SCHEMAS["computer_cancel_req"]
     if path.endswith("/ListGrokBotTranscriptEntries"):
         return _PROTO_SCHEMAS["list_entries_req"]
     if path.endswith("/CreateGrokBotAgent") or path.endswith("/CreateGrokBotTemporalAgent"):
         return _PROTO_SCHEMAS["create_agent_req"]
+    if path.endswith("/CreateGrokBotRoom"):
+        return _PROTO_SCHEMAS["room_create_req"]
+    if path.endswith("/SetGrokBotRoomMembers"):
+        return _PROTO_SCHEMAS["room_set_members_req"]
     if path.endswith("/IssueGrokBotUserComputerCredential"):
         return {1: _proto_schema_field("machineId", "str")}
     if path.endswith("/RegisterSandMachine"):
@@ -1741,6 +2216,7 @@ def _response_schema_for_path(path: str):
         "/SendGrokBotUserMessage": "send_resp", "/ListGrokBotTranscriptEntries": "list_entries_resp",
         "/ListGrokBotAgents": "list_agents_resp", "/CreateGrokBotAgent": "create_agent_resp",
         "/CreateGrokBotTemporalAgent": "create_agent_resp", "/GetMe": "get_me_resp", "/GetUserPrivacyMode": "privacy_resp",
+        "/CreateGrokBotRoom": "room_resp", "/SetGrokBotRoomMembers": "room_resp",
         "/GetSandAccessStatus": "access_resp", "/GetSandTrialClaimStatus": "trial_resp", "/GetHardLimit": "hard_limit_resp",
         "/EnsureSandBox": "ensure_resp", "/EnsureSandBoxWindow": "ensure_resp", "/GetSandBoxRunState": "run_state_resp",
         "/ListSandBoxes": "list_boxes_resp", "/GetGrokBotRuntimeCapabilities": "runtime_caps_resp",
@@ -1748,6 +2224,10 @@ def _response_schema_for_path(path: str):
         "/ListSandMachines": "list_machines_resp", "/UpdateSandMachineLabel": "update_machine_resp",
         "/UpdateSandMachineLocalToolPermission": "update_machine_resp",
         "/GetGrokBotSendStatus": "send_status_resp",
+        "/PollGrokBotUserComputerRequests": "computer_poll_resp",
+        "/SubmitGrokBotUserComputerResponses": "computer_submit_resp",
+        "/ListGrokBotUserComputers": "computer_list_resp",
+        "/CancelGrokBotUserComputerRequest": "computer_cancel_resp",
     }
     for suffix, name in suffix_map.items():
         if path.endswith(suffix):
@@ -1764,7 +2244,16 @@ def _proto_response_obj(path: str, obj):
     if path.endswith("/GetSandBoxRunState"):
         return {"state": {"SAND_BOX_RUN_STATE_RUNNING": 3, "SAND_BOX_RUN_STATE_HIBERNATED": 2, "SAND_BOX_RUN_STATE_ABSENT": 1}.get(obj.get("state"), obj.get("state", 0)), "imageUpdateAvailable": bool(obj.get("imageUpdateAvailable"))}
     if path.endswith("/GetSandAccessStatus"):
-        return {**obj, "state": {"GRANTED": 1, "UNAVAILABLE": 2, "PAYMENT_REQUIRED": 3}.get(obj.get("state"), obj.get("state", 0))}
+        return {
+            **obj,
+            "state": _ENUM_ACCESS_STATE.get(obj.get("state"), obj.get("state", 0)),
+            "purchaseChannel": _ENUM_PURCHASE_CHANNEL.get(
+                obj.get("purchaseChannel"), obj.get("purchaseChannel", 0)
+            ),
+            "blockReason": _ENUM_ACCESS_BLOCK_REASON.get(
+                obj.get("blockReason"), obj.get("blockReason", 0)
+            ),
+        }
     if path.endswith("/GetSandTrialClaimStatus"):
         return {"status": obj.get("status", 0)}
     if path.endswith("/GetGrokBotSendStatus"):
@@ -1866,6 +2355,12 @@ def _gateway_transcript_entry(agent_id: str, entry: dict) -> dict:
         elif not isinstance(content, str):
             body_obj["content"] = str(content)
         body_obj.setdefault("isStreaming", False)
+        member_id = _text_field(body_obj.get("memberAgentId") or body_obj.get("authorId"))
+        if member_id and not isinstance(body_obj.get("fromAgent"), dict):
+            # Older persisted group rows predate the public fromAgent field.
+            # Rehydrate the member identity at the wire boundary so the 0.30
+            # renderer can attribute each reply without rewriting history.
+            body_obj["fromAgent"] = _group_member_agent_ref(member_id)
         # Group replies are distinct rendered messages. Do not expose their
         # private resume nonce (or the legacy user nonce) to the 0.30
         # renderer: `clientNonce` is an optimistic dedupe key, so sharing it
@@ -1875,6 +2370,18 @@ def _gateway_transcript_entry(agent_id: str, entry: dict) -> dict:
             body_obj.pop("clientNonce", None)
 
     return body_obj
+
+
+def _transcript_wire_entry(agent_id: str, entry: dict) -> dict:
+    """Return a native transcript row with a renderer-safe public body."""
+    public = _gateway_transcript_entry(agent_id, entry)
+    original = _entry_body_obj(entry)
+    if original.get("kind") not in {"message", "send_message", "assistant_text"}:
+        return dict(entry)
+    row = dict(entry)
+    row["body"] = b64(json.dumps(public, ensure_ascii=False))
+    row["bodyOmitted"] = False
+    return row
 
 
 def _transcript_event(agent_id: str, entry: dict, generation: int) -> dict:
@@ -1910,44 +2417,119 @@ def _broadcast_transcript_event(agent_id: str, entry: dict, generation: int) -> 
 
 
 def _agent_public(agent_id: str, meta: dict) -> dict:
-    """Return the JSON shape used by the 0.30 local gateway roster API."""
+    """Return the strict SandAgentSummary used by the 0.36 gateway API."""
     now_ms = int(time.time() * 1000)
     with TRANSCRIPT_CHANGED:
         transcript = TRANSCRIPTS.get(agent_id, {"entries": []})
         entries = transcript.get("entries", [])
-        last_entry = dict(entries[-1]) if entries else None
+        stored_last_entry = dict(entries[-1]) if entries else None
+
+    last_entry = None
+    last_message_id = _text_field(meta.get("lastMessageId")) or None
+    last_message_preview = None
+    last_message_author_id = None
+    if stored_last_entry is not None:
+        decoded = _gateway_transcript_entry(agent_id, stored_last_entry)
+        last_message_id = _text_field(decoded.get("id")) or last_message_id
+        content = decoded.get("content")
+        if isinstance(content, str):
+            last_message_preview = content
+            last_entry = {"kind": "text", "text": content}
+            author_id = _text_field(decoded.get("authorId") or decoded.get("memberAgentId"))
+            if author_id:
+                last_entry["authorId"] = author_id
+                last_message_author_id = author_id
+
+    stored_origin = _text_field(meta.get("origin"))
+    origin = "user" if stored_origin == "user" else "dev"
+    return {
+        "id": agent_id,
+        "name": _text_field(meta.get("name"), "Bridge Bot"),
+        "description": _text_field(meta.get("description"), "Explicit model-backed Grok Bot"),
+        "title": _text_field(meta.get("title"), _text_field(meta.get("name"), "Bridge Bot")),
+        "path": _text_field(meta.get("path"), agent_id),
+        "createdAt": meta.get("createdAt", meta.get("createdAtMs", now_ms)),
+        "updatedAt": meta.get("updatedAt", meta.get("updatedAtMs", now_ms)),
+        "hasUnread": bool(meta.get("hasUnread", False)),
+        "unreadCount": int(meta.get("unreadCount", 0) or 0),
+        "notificationsEnabled": bool(meta.get("notificationsEnabled", True)),
+        "notifyOnUpdatesEnabled": bool(meta.get("notifyOnUpdatesEnabled", False)),
+        "isActive": bool(meta.get("isActive", False)),
+        "isRunning": bool(meta.get("isRunning", False)),
+        "isComposingMessage": bool(meta.get("isComposingMessage", False)),
+        "isHiddenFromSidebar": bool(meta.get("isHiddenFromSidebar", False)),
+        "isGroup": bool(meta.get("isGroup", False)),
+        "origin": origin,
+        "lastMessageId": last_message_id,
+        "lastEntry": last_entry,
+        "lastMessagePreview": last_message_preview,
+        "lastMessageAuthorId": last_message_author_id,
+        "newestEntryId": last_message_id,
+        "awaitingUserResponse": None,
+        "memberIds": list(meta.get("memberIds", [])),
+        "avatarShape": _text_field(meta.get("avatarShape")) or None,
+        "avatarColor": _text_field(meta.get("avatarColor")) or None,
+        # 0.36 requires the field even when slim-avatar mode omits the bytes.
+        "avatarDataUrl": None,
+        "avatarVersion": _text_field(meta.get("avatarVersion")) or None,
+        "runningSessionIds": [],
+        "viewerIsOwner": True,
+        "viewerSessionId": _text_field(meta.get("viewerSessionId")),
+    }
+
+
+def _agent_proto(agent_id: str, meta: dict) -> dict:
+    """Return the native protobuf agent record without gateway-only fields."""
+    now_ms = int(time.time() * 1000)
     return {
         "id": agent_id,
         "legacyAgentId": agent_id,
         "agentId": agent_id,
-        "name": meta.get("name", "Bridge Bot"),
-        "description": meta.get("description", "Local Ollama-backed Grok Bot"),
-        "title": meta.get("title", meta.get("name", "Bridge Bot")),
-        # The 0.30 renderer validates these roster fields before accepting the
-        # array. Keep the local representation compatible with its Xkn guard.
-        "path": meta.get("path", agent_id),
-        "createdAt": meta.get("createdAt", meta.get("createdAtMs", now_ms)),
-        "updatedAt": meta.get("updatedAt", meta.get("updatedAtMs", now_ms)),
-        "hasUnread": bool(meta.get("hasUnread", False)),
-        "notificationsEnabled": bool(meta.get("notificationsEnabled", True)),
-        "notifyOnUpdatesEnabled": bool(meta.get("notifyOnUpdatesEnabled", False)),
-        "isGroup": bool(meta.get("isGroup", False)),
-        "origin": meta.get("origin", "local"),
-        "lastMessageId": meta.get("lastMessageId", last_entry.get("entryId") if last_entry else None),
-        "lastEntry": last_entry,
-        "awaitingUserResponse": meta.get("awaitingUserResponse"),
-        "memberIds": list(meta.get("memberIds", [])),
-        "avatarShape": meta.get("avatarShape", ""),
-        "avatarColor": meta.get("avatarColor", ""),
-        # Keep the roster lightweight.  The renderer fetches the PNG through
-        # getAgentAvatar when this version changes.
-        "avatarVersion": meta.get("avatarVersion", ""),
+        "name": _text_field(meta.get("name"), "Bridge Bot"),
+        "description": _text_field(meta.get("description"), "Explicit model-backed Grok Bot"),
+        "title": _text_field(meta.get("title"), _text_field(meta.get("name"), "Bridge Bot")),
+        "avatarShape": _text_field(meta.get("avatarShape")),
+        "avatarColor": _text_field(meta.get("avatarColor")),
+        "avatarVersion": _text_field(meta.get("avatarVersion")),
+        "avatarUrl": "",
         "createdAtMs": meta.get("createdAtMs", now_ms),
         "updatedAtMs": meta.get("updatedAtMs", now_ms),
-        "harness": meta.get("harness", "box"),
-        "role": meta.get("role", "assistant"),
+        "harness": _text_field(meta.get("harness"), "box"),
+        "role": _text_field(meta.get("role"), "assistant"),
         "viewerIsOwner": True,
+        "viewerSessionId": _text_field(meta.get("viewerSessionId")),
+        "kind": "ROOM" if meta.get("isGroup") else "AGENT",
+        "memberAgentIds": list(meta.get("memberIds", [])),
     }
+
+
+def _agent_roster_snapshot() -> list[tuple[str, dict]]:
+    """Snapshot agents while hiding empty local aliases shadowed by channels."""
+    with TRANSCRIPT_CHANGED:
+        shadowed = set()
+        for group_meta in AGENT_INDEX.values():
+            if not group_meta.get("isGroup"):
+                continue
+            for alias in {_text_field(group_meta.get("name")), _text_field(group_meta.get("title"))}:
+                if not alias:
+                    continue
+                plain = AGENT_INDEX.get(alias)
+                if (
+                    isinstance(plain, dict)
+                    and not plain.get("isGroup")
+                    and plain.get("origin") == "local"
+                    and not TRANSCRIPTS.get(alias, {}).get("entries")
+                ):
+                    shadowed.add(alias)
+        return [(aid, dict(meta)) for aid, meta in AGENT_INDEX.items() if aid not in shadowed]
+
+
+def _public_agent_roster() -> list[dict]:
+    return [_agent_public(agent_id, meta) for agent_id, meta in _agent_roster_snapshot()]
+
+
+def _proto_agent_roster() -> list[dict]:
+    return [_agent_proto(agent_id, meta) for agent_id, meta in _agent_roster_snapshot()]
 
 
 def _channels_view(agent_id: str = "") -> dict:
@@ -1964,7 +2546,7 @@ def _channels_view(agent_id: str = "") -> dict:
 
 def _transcript_tail(agent_id: str, limit: int, before_seq=None) -> dict:
     """Read the local transcript using the 0.30 gateway command contract."""
-    agent_id = str(agent_id or "bridge-agent-local")
+    agent_id = _resolve_agent_id(str(agent_id or "")) or "bridge-agent-local"
     try:
         limit = max(1, min(int(limit or 200), 1000))
     except (TypeError, ValueError):
@@ -1987,10 +2569,14 @@ def _transcript_tail(agent_id: str, limit: int, before_seq=None) -> dict:
     page = eligible[-limit:]
     first_seq = int(page[0].get("seq", 0)) if page else 0
     next_before = first_seq - 1 if first_seq > 1 else None
-    return {
+    result = {
         "entries": [_gateway_transcript_entry(agent_id, entry) for entry in page],
-        "nextBeforeSeq": next_before,
     }
+    if next_before is not None:
+        # Grok Bot 0.36 defines this as an optional number.  A terminal
+        # ``null`` cursor fails the coordinator's structural reply validator.
+        result["nextBeforeSeq"] = next_before
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2109,6 +2695,7 @@ class Handler(BaseHTTPRequestHandler):
             aid = cursor.get("agentId", cursor.get("agent_id", ""))
             if not aid:
                 continue
+            aid = _resolve_agent_id(str(aid))
             try:
                 after = int(cursor.get("afterUpdatedSeq", cursor.get("after_updated_seq", 0)))
             except (TypeError, ValueError):
@@ -2148,12 +2735,16 @@ class Handler(BaseHTTPRequestHandler):
                     "rows": {
                         "agentId": aid,
                         "generation": generation,
-                        "entries": entries,
+                        "entries": [_transcript_wire_entry(aid, entry) for entry in entries],
                         "deletes": [],
                         "replay": True,
                     }
                 }
             )
+            # The replay is already part of the client's starting cursor.
+            # Advance it before entering the live wait loop, otherwise the
+            # first heartbeat cycle emits the entire replay a second time.
+            cursor_map[aid] = max(int(entry["updatedSeq"]) for entry in entries)
 
         # Keep the stream alive and wake it whenever SendGrokBotUserMessage or the
         # local model appends an entry. The heartbeat prevents idle proxies from
@@ -2181,7 +2772,7 @@ class Handler(BaseHTTPRequestHandler):
                         "rows": {
                             "agentId": aid,
                             "generation": generation,
-                            "entries": entries,
+                            "entries": [_transcript_wire_entry(aid, entry) for entry in entries],
                             "deletes": [],
                             "replay": False,
                         }
@@ -2210,6 +2801,9 @@ class Handler(BaseHTTPRequestHandler):
 
         machine_id = request.get("machineId", request.get("machine_id", ""))
         hello = request.get("hello") or {}
+        presence = None
+        if machine_id:
+            presence = _register_user_computer_presence(str(machine_id), hello)
         self._connect_stream_start()
         self._connect_stream_write({"connected": {"pendingRequestCount": 0}})
         log(
@@ -2220,12 +2814,18 @@ class Handler(BaseHTTPRequestHandler):
         # No computer requests are queued locally yet. Keep the native presence
         # stream open with the exact protobuf event shape expected by 0.30.
         last_heartbeat = time.monotonic()
-        while True:
-            time.sleep(1)
-            if time.monotonic() - last_heartbeat < 15:
-                continue
-            self._connect_stream_write({"heartbeat": {"pendingRequestCount": 0}})
-            last_heartbeat = time.monotonic()
+        try:
+            while True:
+                time.sleep(1)
+                if time.monotonic() - last_heartbeat < 15:
+                    continue
+                self._connect_stream_write({"heartbeat": {"pendingRequestCount": 0}})
+                last_heartbeat = time.monotonic()
+                if machine_id and presence is not None:
+                    _touch_user_computer_presence(str(machine_id), presence)
+        finally:
+            if machine_id and presence is not None:
+                _remove_user_computer_presence(str(machine_id), presence)
 
     def _local_exec_requests(self) -> None:
         provider_id = str(uuid.uuid4())
@@ -2258,9 +2858,28 @@ class Handler(BaseHTTPRequestHandler):
         route = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=False)
 
+        if route == "/auth/cursor_dev_session_token":
+            # The native dev-login contract is intentionally available only
+            # from this backend's loopback listener. Never turn this into a
+            # remotely reachable session-minting endpoint.
+            bind_host = str(self.server.server_address[0]).strip().lower()
+            if bind_host not in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+                self._record(b"", status=403)
+                self._reply(403, {"error": "local_dev_login_requires_loopback"})
+                return
+            self._record(b"", status=200)
+            self._reply(200, handle_dev_session_token(query))
+            return
+
         if route == "/health":
             self._record(b"")
             self._reply(200, {"ok": True})
+            return
+
+        if route == "/model-runtime":
+            snapshot = _model_runtime_snapshot()
+            self._record(b"", status=200 if snapshot.get("ok") else 503)
+            self._reply(200 if snapshot.get("ok") else 503, snapshot)
             return
 
         if route == "/events":
@@ -2296,7 +2915,7 @@ class Handler(BaseHTTPRequestHandler):
             if not AGENT_INDEX:
                 ensure_agent("bridge-agent-local")
             self._record(b"")
-            self._reply(200, [_agent_public(aid, meta) for aid, meta in AGENT_INDEX.items()])
+            self._reply(200, _public_agent_roster())
             return
 
         if route == "/api/countAgents":
@@ -2328,7 +2947,7 @@ class Handler(BaseHTTPRequestHandler):
                     "latestHostVersion": None,
                     "hostUpdateAvailable": False,
                     "isBusy": False,
-                    "capabilities": ["transcript", "send", "local-ollama"],
+                    "capabilities": _host_capabilities(),
                 },
             )
             return
@@ -2376,7 +2995,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/listAgents":
             if not AGENT_INDEX:
                 ensure_agent("bridge-agent-local")
-            self._reply(200, [_agent_public(aid, meta) for aid, meta in AGENT_INDEX.items()])
+            self._reply(200, _public_agent_roster())
             return
 
         if self.path == "/api/countAgents":
@@ -2400,6 +3019,14 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, _channels_view(_first_agent_id(req)))
             return
 
+        if self.path == "/api/getHostSettings":
+            self._reply(200, _host_settings_snapshot())
+            return
+
+        if self.path == "/api/setHostSettings":
+            self._reply(200, _update_host_settings(req))
+            return
+
         if self.path == "/api/getHostStatus":
             self._reply(
                 200,
@@ -2408,7 +3035,7 @@ class Handler(BaseHTTPRequestHandler):
                     "latestHostVersion": None,
                     "hostUpdateAvailable": False,
                     "isBusy": False,
-                    "capabilities": ["transcript", "send", "local-ollama"],
+                    "capabilities": _host_capabilities(),
                 },
             )
             return
@@ -2535,13 +3162,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.endswith("/WatchSandBoxMigration"):
-            # Server-streaming: one DONE event, then an explicit Connect
-            # EndStreamResponse.  EOF after a data envelope is an incomplete
-            # stream and the 0.30 client reports it as InvalidArgument.
+            # The native watcher is a long-lived relay.  It consumes a DONE
+            # event but keeps the RPC open; closing immediately makes the 0.36
+            # client restart the watcher on its three-second reconnect loop.
             migration = {"phase": 6, "detail": "", "atMs": int(time.time() * 1000), "offsetKey": ""}
             self._connect_stream_start()
             self._connect_stream_write(migration, schema=_PROTO_SCHEMAS["migration_event"])
-            self._connect_stream_end()
+            try:
+                while True:
+                    time.sleep(15)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                log("[migration] watch disconnected")
             return
 
         if self.path.endswith("/RegisterSandMachine"):
@@ -2610,6 +3241,60 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, {"acceptedCount": len(frames)})
             return
 
+        if self.path.endswith("/PollGrokBotUserComputerRequests"):
+            machine_id = str(req.get("machineId", req.get("machine_id", "")) or "")
+            credential = str(req.get("credential", "") or "")
+            if credential != LOCAL_EXEC_CREDENTIAL:
+                self._reply(401, {"requests": []}, schema=_PROTO_SCHEMAS["computer_poll_resp"])
+                return
+            if machine_id:
+                with LOCK:
+                    presence = USER_COMPUTER_PRESENCE.get(machine_id)
+                    if presence is not None:
+                        presence["lastSeenAtMs"] = int(time.time() * 1000)
+            # The local bridge has no queued computer work yet. Returning the
+            # typed empty list is important: the native client treats a
+            # content-type-correct, schema-correct empty poll as healthy.
+            self._reply(200, {"requests": []}, schema=_PROTO_SCHEMAS["computer_poll_resp"])
+            return
+
+        if self.path.endswith("/SubmitGrokBotUserComputerResponses"):
+            machine_id = str(req.get("machineId", req.get("machine_id", "")) or "")
+            credential = str(req.get("credential", "") or "")
+            if credential != LOCAL_EXEC_CREDENTIAL:
+                self._reply(401, {"acceptedCount": 0}, schema=_PROTO_SCHEMAS["computer_submit_resp"])
+                return
+            frames = req.get("frames") or []
+            if machine_id:
+                with LOCK:
+                    presence = USER_COMPUTER_PRESENCE.get(machine_id)
+                    if presence is not None:
+                        presence["lastSeenAtMs"] = int(time.time() * 1000)
+            self._reply(
+                200,
+                {"acceptedCount": len(frames)},
+                schema=_PROTO_SCHEMAS["computer_submit_resp"],
+            )
+            return
+
+        if self.path.endswith("/ListGrokBotUserComputers"):
+            with LOCK:
+                computers = [dict(item) for item in USER_COMPUTER_PRESENCE.values()]
+            self._reply(200, {"computers": computers}, schema=_PROTO_SCHEMAS["computer_list_resp"])
+            return
+
+        if self.path.endswith("/OpenGrokBotUserComputerRequest"):
+            # No local request queue is produced by this bridge. Complete the
+            # server-streaming RPC with a typed Connect end envelope instead of
+            # falling through to an unrelated JSON/proto unary response.
+            self._connect_stream_start()
+            self._connect_stream_end()
+            return
+
+        if self.path.endswith("/CancelGrokBotUserComputerRequest"):
+            self._reply(200, {}, schema=_PROTO_SCHEMAS["computer_cancel_resp"])
+            return
+
         if self.path.endswith("/WatchGrokBotTranscripts"):
             try:
                 self._watch_transcripts(body)
@@ -2625,7 +3310,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.endswith("/SendGrokBotUserMessage"):
-            agent_id = req.get("agentId", "")
+            agent_id = _resolve_agent_id(req.get("agentId", ""))
             text = req.get("text", "")
             client_nonce = str(req.get("messageId") or uuid.uuid4())
             ensure_agent(agent_id or "bridge-agent-local")
@@ -2647,18 +3332,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.endswith("/ListGrokBotTranscriptEntries"):
-            agent_id = req.get("agentId", "")
+            agent_id = _resolve_agent_id(req.get("agentId", ""))
             with TRANSCRIPT_CHANGED:
                 t = TRANSCRIPTS.get(agent_id, {"generation": 1, "entries": []})
                 entries = [dict(e) for e in t["entries"]]
                 gen = t["generation"]
+            entries = [_transcript_wire_entry(agent_id, entry) for entry in entries]
             self._reply(200, {"entries": entries, "generation": gen}, schema=_PROTO_SCHEMAS["list_entries_resp"])
             return
 
         if self.path.endswith("/ListGrokBotAgents"):
             if not AGENT_INDEX:
                 ensure_agent("bridge-agent-local")
-            agents = [_agent_public(aid, meta) for aid, meta in AGENT_INDEX.items()]
+            agents = _proto_agent_roster()
             self._reply(200, {"agents": agents}, schema=_PROTO_SCHEMAS["list_agents_resp"])
             return
 
@@ -2675,19 +3361,63 @@ class Handler(BaseHTTPRequestHandler):
             meta = ensure_agent(
                 aid,
                 name=req.get("name", "Bridge Bot"),
-                description=req.get("description", "Local Ollama-backed Grok Bot"),
+                description=req.get("description", "Explicit model-backed Grok Bot"),
             )
             log(f"[agent] created {aid} {meta['name']}")
             self._reply(
                 200,
                 {
-                    "agent": {"id": aid, "legacyAgentId": aid, "agentId": aid, **meta},
+                    "agent": _agent_proto(aid, meta),
                     # This is GrokBotAgentHarnessKind, where BOX=1. The value
                     # 4 belongs to the separate TemporalHarnessMode enum and
                     # makes a protobuf client reject an otherwise valid agent.
                     "harness": _ENUM_AGENT_HARNESS["GROK_BOT_AGENT_HARNESS_KIND_BOX"],
                 },
                 schema=_PROTO_SCHEMAS["create_agent_resp"],
+            )
+            return
+
+        if self.path.endswith("/CreateGrokBotRoom"):
+            try:
+                response = _create_gateway_group(
+                    {
+                        "agentId": req.get("agentId"),
+                        "name": req.get("name"),
+                        "description": req.get("description"),
+                        "memberAgentIds": req.get("memberAgentIds", []),
+                    }
+                )
+            except GatewayContractError as exc:
+                self._reply(exc.status, exc.payload)
+                return
+            group_id = response["agent"]["id"]
+            with TRANSCRIPT_CHANGED:
+                group_meta = dict(AGENT_INDEX[group_id])
+            self._reply(
+                200,
+                {"agent": _agent_proto(group_id, group_meta)},
+                schema=_PROTO_SCHEMAS["room_resp"],
+            )
+            return
+
+        if self.path.endswith("/SetGrokBotRoomMembers"):
+            try:
+                response = _set_gateway_group_members(
+                    {
+                        "id": req.get("agentId"),
+                        "memberAgentIds": req.get("memberAgentIds", []),
+                    }
+                )
+            except GatewayContractError as exc:
+                self._reply(exc.status, exc.payload)
+                return
+            group_id = response["agent"]["id"]
+            with TRANSCRIPT_CHANGED:
+                group_meta = dict(AGENT_INDEX[group_id])
+            self._reply(
+                200,
+                {"agent": _agent_proto(group_id, group_meta)},
+                schema=_PROTO_SCHEMAS["room_resp"],
             )
             return
 
