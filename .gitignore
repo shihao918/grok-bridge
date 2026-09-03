@@ -3,3 +3,16 @@ logs/
 *.pyc
 __pycache__/
 .venv/
+.tmp_app_extract/
+
+# Local Grok Bot candidate packages and runtime profiles.
+/.tmp_app_candidate_*/
+/.tmp_grokbot*_candidate_user_data*/
+
+# Local Grok Bot probe output and reconstructed ASAR artifacts.
+/.tmp_*.log
+/.tmp_*.diff
+/.tmp_grokbot*.app.asar
+*.asar.bak
+*.asar.backup
+*.asar.orig

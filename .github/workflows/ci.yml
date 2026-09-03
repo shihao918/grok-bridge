@@ -1,8 +1,10 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+  # This repository is validated on the Windows host with
+  # tools/verify_local_036.ps1. Keep hosted runners opt-in so pushes and pull
+  # requests do not create paid GitHub Actions jobs.
+  workflow_dispatch:
 
 jobs:
   static-checks:
@@ -15,8 +17,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet -r requirements.txt
+
       - name: Syntax check (compileall)
         run: python -m compileall -q daemon.py bridge_common.py local_proxy.py tools/
+
+      - name: Syntax check (model runtime and backend)
+        run: python -m py_compile model_runtime.py backend_server.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Secret scan
         run: python scripts/secret_scan.py

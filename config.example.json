@@ -1,0 +1,9 @@
+{
+  "model_backend": "codex",
+  "gateway": "https://your-model-gateway.example/v1",
+  "local_root": "C:\\path\\to\\workspace",
+  "label": "MultiAgent-Bridge",
+  "ags_user": "your-agentsstudio-user@example.com",
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "lfm2.5:8b-a1b"
+}
