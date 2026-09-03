@@ -1,5 +1,8 @@
 # Writing a handler
 
+> Legacy/standalone scope: this document describes the `daemon.py` handler surface,
+> not the Grok Bot 0.36 coordinator, channel lifecycle, or Codex Responses path.
+
 A handler turns an `exec` frame's task into a result dict. Everything lives in the
 `HANDLERS` dict at the bottom of `daemon.py`.
 
