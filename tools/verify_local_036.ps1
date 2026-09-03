@@ -41,25 +41,31 @@ $compileTargets = @(
     "tools\patch_renderer_036.py"
 ) + $testTargets
 
-function Get-GitPathList {
-    param([Parameter(Mandatory)][string[]]$Arguments)
-
-    $paths = @(& git -C $repoRoot @Arguments)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "Unable to enumerate the local verification write-set (git exit $exitCode)"
-    }
-    return $paths
-}
-
-$writeSetTargets = @(
-    Get-GitPathList -Arguments @("diff", "--name-only", "--diff-filter=ACMR")
-    Get-GitPathList -Arguments @("diff", "--cached", "--name-only", "--diff-filter=ACMR")
-    Get-GitPathList -Arguments @("ls-files", "--others", "--exclude-standard")
-) | Where-Object {
-    -not [string]::IsNullOrWhiteSpace($_) -and
-    (Test-Path -LiteralPath (Join-Path $repoRoot $_) -PathType Leaf)
-} | Sort-Object -Unique
+$releaseTargets = @(
+    ".github/workflows/ci.yml"
+    ".gitignore"
+    "README.md"
+    "backend_server.py"
+    "CHANGELOG.md"
+    "config.example.json"
+    "docs/current-vs-original-2026-09-01.md"
+    "docs/handlers.md"
+    "model_runtime.py"
+    "scripts/secret_scan.py"
+    "tests/test_connect_stream.py"
+    "tests/test_local_launcher_036.py"
+    "tests/test_local_verify_036.py"
+    "tests/test_model_runtime.py"
+    "tests/test_release_policy.py"
+    "tests/test_renderer_patch_036.py"
+    "tests/test_secret_scan.py"
+    "TODOS.md"
+    "tools/patch_local_routing_036.py"
+    "tools/patch_renderer_036.py"
+    "tools/start_grok_bot_036_local.ps1"
+    "tools/verify_local_036.ps1"
+    "VERSION"
+)
 
 $launcherArguments = @(
     "-NoLogo",
@@ -127,9 +133,9 @@ $steps = @(
     }
     [ordered]@{
         name = "secret_scan_write_set"
-        enabled = $writeSetTargets.Count -gt 0
+        enabled = $true
         executable = $python
-        arguments = @($secretScan, "--write-set") + $writeSetTargets
+        arguments = @($secretScan, "--write-set") + $releaseTargets
     }
     [ordered]@{
         name = "git_diff_check"

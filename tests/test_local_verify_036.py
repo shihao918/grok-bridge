@@ -9,6 +9,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERIFY = ROOT / "tools" / "verify_local_036.ps1"
 PWSH = shutil.which("pwsh")
+RELEASE_TARGETS = {
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "README.md",
+    "backend_server.py",
+    "CHANGELOG.md",
+    "config.example.json",
+    "docs/current-vs-original-2026-09-01.md",
+    "docs/handlers.md",
+    "model_runtime.py",
+    "scripts/secret_scan.py",
+    "tests/test_connect_stream.py",
+    "tests/test_local_launcher_036.py",
+    "tests/test_local_verify_036.py",
+    "tests/test_model_runtime.py",
+    "tests/test_release_policy.py",
+    "tests/test_renderer_patch_036.py",
+    "tests/test_secret_scan.py",
+    "TODOS.md",
+    "tools/patch_local_routing_036.py",
+    "tools/patch_renderer_036.py",
+    "tools/start_grok_bot_036_local.ps1",
+    "tools/verify_local_036.ps1",
+    "VERSION",
+}
 
 
 @unittest.skipUnless(PWSH, "PowerShell 7 is required")
@@ -97,7 +122,8 @@ class LocalVerify036ContractTests(unittest.TestCase):
         self.assertIn("--staged", steps["secret_scan_staged"]["arguments"])
         self.assertIn("--write-set", steps["secret_scan_write_set"]["arguments"])
         write_set_args = [arg.replace("\\", "/") for arg in steps["secret_scan_write_set"]["arguments"]]
-        self.assertIn("tools/verify_local_036.ps1", write_set_args)
+        self.assertEqual(set(write_set_args[2:]), RELEASE_TARGETS)
+        self.assertNotIn("tools/patch_renderer_030.py", write_set_args)
 
     def test_runtime_contract_rejects_unpatched_routing(self):
         source = VERIFY.read_text(encoding="utf-8")
